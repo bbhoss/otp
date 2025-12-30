@@ -155,5 +155,118 @@ The current erl_interface implementation is IPv4-only. IPv6 support would requir
 ## Memory Usage
 
 - Binary size: ~375 KB (with all encoders/decoders)
-- Heap usage during connection: ~100 KB peak
+- Heap usage during connection: ~100 KB peak (with dynamic allocation)
+- Static pool usage: ~15 KB peak (with static allocation mode)
 - Could be reduced by excluding unused encoders/decoders
+
+## Static Memory Allocation Mode
+
+For embedded systems that cannot use dynamic memory allocation (no heap, or deterministic memory requirements), a static pool allocator can replace `malloc`/`realloc`/`free`.
+
+### Configuration
+
+Add to `config.h`:
+```c
+/* Use simple socket info array instead of segment-based allocation.
+ * The segment-based approach allocates ~90KB per segment which is
+ * too much for embedded systems with static memory pools. */
+#define EI_DISABLE_SEQ_SOCKET_INFO 1
+```
+
+### Static Pool Implementation (`ei_malloc.c`)
+
+Replace the standard malloc wrapper with a bump allocator:
+
+```c
+/*
+ * Pool must be large enough for:
+ * - 1 socket info array (5 * ~3KB = ~15KB)
+ * - ei_x_buff message buffers (~2KB each)
+ * - Other small allocations
+ */
+#define EI_POOL_SIZE      20480  /* 20KB total pool size */
+#define EI_MAX_ALLOCS     16     /* Maximum concurrent allocations */
+
+static char ei_pool[EI_POOL_SIZE] __attribute__((aligned(4)));
+static size_t ei_pool_used = 0;
+
+/* Allocation tracking for realloc/free */
+typedef struct {
+    void *ptr;
+    size_t size;
+} ei_alloc_entry;
+
+static ei_alloc_entry ei_allocs[EI_MAX_ALLOCS];
+static int ei_alloc_count = 0;
+
+void* ei_malloc(long size) {
+    size_t aligned_size = (size + 3) & ~3;  /* 4-byte alignment */
+    if (ei_pool_used + aligned_size > EI_POOL_SIZE) return NULL;
+    if (ei_alloc_count >= EI_MAX_ALLOCS) return NULL;
+
+    void *ptr = &ei_pool[ei_pool_used];
+    ei_pool_used += aligned_size;
+
+    ei_allocs[ei_alloc_count].ptr = ptr;
+    ei_allocs[ei_alloc_count].size = size;
+    ei_alloc_count++;
+    return ptr;
+}
+
+void* ei_realloc(void *orig, long size) {
+    if (orig == NULL) return ei_malloc(size);
+    /* Allocate new block, copy data, mark old as freed */
+    /* ... */
+}
+
+void ei_free(void *ptr) {
+    /* Mark allocation as freed (memory not returned to pool) */
+    /* ... */
+}
+
+void ei_pool_reset(void) {
+    ei_pool_used = 0;
+    ei_alloc_count = 0;
+}
+```
+
+### Why `EI_DISABLE_SEQ_SOCKET_INFO` is Required
+
+The default socket info implementation uses a segment-based array where each segment holds 32 `ei_socket_info` structures. Each structure contains:
+- Full `ei_cnode` copy (~1.1 KB with node names)
+- Cookie buffer (513 bytes)
+- Socket state (~16 bytes)
+
+Total per entry: ~3 KB
+Segment size: 32 × 3 KB ≈ **96 KB per segment**
+
+This is far too large for embedded static pools. The `EI_DISABLE_SEQ_SOCKET_INFO` flag enables a simpler implementation that allocates a growable array of 5 entries at a time (~15 KB), which fits within a 20 KB pool.
+
+### Memory Usage with Static Allocation
+
+Tested results:
+```
+Pool after reset:   0/20480 bytes, 0 allocs
+Pool after xinit:   0/20480 bytes, 0 allocs
+Pool after connect: 14320/20480 bytes, 1 allocs  (socket info array)
+```
+
+### Lifecycle Management
+
+For single-connection embedded use:
+1. Call `ei_pool_reset()` before each connection attempt
+2. Use connection normally
+3. After disconnect, call `ei_pool_reset()` to reclaim all memory
+
+The bump allocator never truly frees memory - it marks allocations as freed for `realloc` tracking, but the pool is only reset in full by `ei_pool_reset()`.
+
+### Trade-offs
+
+| Aspect | Dynamic Allocation | Static Pool |
+|--------|-------------------|-------------|
+| Memory overhead | Per-allocation headers | Fixed pool + tracking array |
+| Fragmentation | Possible | None (bump allocator) |
+| Peak usage | ~100 KB | ~15 KB (configurable) |
+| Multiple connections | Unlimited | Limited by pool size |
+| Free behavior | Immediate | Deferred until reset |
+| Determinism | Variable | Constant time |
