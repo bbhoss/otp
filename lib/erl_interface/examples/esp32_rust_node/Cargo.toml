@@ -1,0 +1,44 @@
+[package]
+name = "erlang_node"
+version = "0.1.0"
+edition = "2021"
+description = "Minimal Erlang C-node implementation for ESP32"
+license = "Apache-2.0"
+
+[lib]
+name = "erlang_node"
+path = "src/lib.rs"
+
+[[bin]]
+name = "test_node"
+path = "src/bin/test_node.rs"
+
+[features]
+default = ["std"]
+std = []
+esp32 = ["std"]
+
+[dependencies]
+# Erlang External Term Format encoding/decoding
+eetf = "0.11"
+
+# For BigInteger conversion
+num-traits = "0.2"
+
+# MD5 for distribution handshake authentication
+md5 = "0.7"
+
+# For network byte order
+byteorder = "1.5"
+
+# Logging
+log = "0.4"
+env_logger = "0.11"
+
+[dev-dependencies]
+
+# For ESP32 builds with esp-idf-hal
+[target.'cfg(target_os = "espidf")'.dependencies]
+esp-idf-hal = "0.45"
+esp-idf-svc = "0.50"
+embedded-svc = "0.28"
