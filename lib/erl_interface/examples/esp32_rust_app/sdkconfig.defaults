@@ -1,0 +1,14 @@
+# ESP32 specific settings
+CONFIG_IDF_TARGET="esp32"
+
+# Enable console output
+CONFIG_ESP_CONSOLE_UART_DEFAULT=y
+
+# Stack size
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=16384
+
+# Enable LWIP for networking
+CONFIG_LWIP_SO_RCVBUF=y
+
+# Enable std support
+CONFIG_COMPILER_CXX_EXCEPTIONS=y

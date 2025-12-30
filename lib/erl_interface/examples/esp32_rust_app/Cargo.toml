@@ -1,0 +1,31 @@
+[package]
+name = "esp32-rust-node"
+version = "0.1.0"
+edition = "2021"
+resolver = "2"
+
+[profile.release]
+opt-level = "s"
+
+[profile.dev]
+debug = true
+opt-level = "z"
+
+[dependencies]
+# ESP-IDF HAL and service layers
+esp-idf-hal = "0.45"
+esp-idf-svc = { version = "0.50", features = ["std"] }
+esp-idf-sys = { version = "0.36", features = ["binstart"] }
+embedded-svc = "0.28"
+
+# Logging
+log = "0.4"
+
+# Error handling
+anyhow = "1.0"
+
+# Our Erlang node library (local path)
+erlang_node = { path = "../otp/lib/erl_interface/examples/esp32_rust_node" }
+
+[build-dependencies]
+embuild = { version = "0.32", features = ["espidf"] }
