@@ -70,12 +70,31 @@ impl CNode {
         let addr = format!("{}:{}", host, port);
         let stream = TcpStream::connect(&addr)?;
 
-        // Set socket options
-        stream.set_nodelay(true)?;
+        // Set socket options (optional, may not be supported on all platforms)
+        let _ = stream.set_nodelay(true);
 
         // Clone for reader/writer
-        let mut reader = BufReader::new(stream.try_clone()?);
-        let mut writer = BufWriter::new(stream);
+        // On ESP32/LWIP, try_clone may not work, so we use unsafe pointer sharing
+        #[cfg(not(target_os = "espidf"))]
+        let (reader, writer) = {
+            let reader = BufReader::new(stream.try_clone()?);
+            let writer = BufWriter::new(stream);
+            (reader, writer)
+        };
+
+        #[cfg(target_os = "espidf")]
+        let (mut reader, mut writer) = {
+            use std::os::fd::{AsRawFd, FromRawFd};
+            // On ESP-IDF, we share the same fd for read and write
+            // This works because TCP is full-duplex and we control the protocol
+            let fd = stream.as_raw_fd();
+            std::mem::forget(stream); // Don't drop the stream, we're taking ownership
+            let read_stream = unsafe { TcpStream::from_raw_fd(fd) };
+            let write_stream = unsafe { TcpStream::from_raw_fd(fd) };
+            let reader = BufReader::new(read_stream);
+            let writer = BufWriter::new(write_stream);
+            (reader, writer)
+        };
 
         // Perform handshake using the same reader/writer we'll use later
         let mut handshake = Handshake::new(&self.full_name, &self.cookie, self.creation);
