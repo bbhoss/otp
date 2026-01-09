@@ -1,0 +1,15 @@
+{application, mnesia_nvme,
+ [{description, "Mnesia backend for NVMe Key-Value SSDs"},
+  {vsn, "0.1.0"},
+  {registered, []},
+  {applications, [kernel, stdlib, mnesia]},
+  {env, [
+    {device_path, "/dev/ng0n1"},      % NVMe char device (generic)
+    {queue_depth, 64},                 % io_uring queue depth
+    {max_key_size, 16},                % NVMe KV default max key size
+    {max_value_size, 2097152}          % 2MB max value
+  ]},
+  {modules, [mnesia_nvme_backend, mnesia_nvme_nif]},
+  {licenses, ["Apache-2.0"]},
+  {links, []}
+ ]}.

@@ -1,0 +1,14 @@
+# Compiled files
+ebin/
+*.beam
+priv/*.so
+
+# Mnesia data
+Mnesia.*/
+
+# Crash dumps
+erl_crash.dump
+
+# Build artifacts
+_build/
+*.o
