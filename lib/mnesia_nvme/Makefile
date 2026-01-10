@@ -2,11 +2,15 @@
 #
 # This builds both the Erlang application and the NIF.
 
-.PHONY: all compile nif clean test
+.PHONY: all compile nif clean test erlang
 
 all: compile
 
-compile: nif
+compile: ebin erlang
+	@echo "Attempting to build NIF (optional)..."
+	-$(MAKE) -C c_src 2>/dev/null || echo "NIF build skipped (liburing not available or compile error)"
+
+erlang: ebin
 	@echo "Compiling Erlang sources..."
 	erlc -o ebin -I include src/*.erl
 

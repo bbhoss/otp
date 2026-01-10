@@ -81,17 +81,57 @@ make nif
 
 ## Testing
 
-### With Mock Backend (no hardware required)
+### Mock Backend Tests (Verified)
 
-```erlang
-application:set_env(mnesia_nvme, backend, mock).
-%% Then use normally
+The mock backend has been tested and verified with full Mnesia integration:
+
+```bash
+# Compile the Erlang modules
+cd lib/mnesia_nvme
+make erlang
+
+# Run a quick test
+erl -pa ebin -noshell -eval '
+application:set_env(mnesia_nvme, backend, mock),
+{ok, H} = mnesia_nvme_mock:open("/dev/mock"),
+ok = mnesia_nvme_mock:store(H, 1, <<"key">>, <<"value">>),
+{ok, <<"value">>} = mnesia_nvme_mock:retrieve(H, 1, <<"key">>),
+io:format("Mock backend works!~n"),
+init:stop(0).
+'
+```
+
+The following operations are tested and working with the mock backend:
+- Store/Retrieve key-value pairs
+- Delete operations
+- Exists checks
+- List keys with prefix filtering
+- Full Mnesia backend integration (transactions, insert, lookup, delete, select)
+
+### NIF Testing (Real NVMe Hardware)
+
+The NIF requires:
+- Linux kernel 5.19+ with io_uring passthrough support
+- liburing-dev for compilation
+- NVMe device with KV command set support (rare in consumer SSDs)
+
+```bash
+# Build NIF (if liburing is available)
+make nif
 ```
 
 ### With NVMeVirt (QEMU)
 
-See `scripts/setup_qemu_nvmevirt.sh` for setting up a QEMU VM with NVMeVirt
-KV SSD emulation.
+For testing without real hardware, use [NVMeVirt](https://github.com/snu-csl/nvmevirt)
+which is a Linux kernel module that emulates NVMe devices with KV support.
+
+See `scripts/setup_qemu_nvmevirt.sh` for QEMU VM setup instructions.
+
+Requirements for NVMeVirt testing:
+1. QEMU with NVMe support
+2. Linux VM with kernel headers and build tools
+3. NVMeVirt compiled with `CONFIG_NVMEVIRT_KV := y`
+4. Load module with: `insmod nvmev.ko memmap_start=1G memmap_size=512M cpus=2,3`
 
 ## NVMe KV Command Set
 

@@ -72,7 +72,13 @@
 #define NVME_URING_CMD_IO 0x00
 #endif
 
-struct nvme_uring_cmd {
+/*
+ * Use system definitions from linux/nvme_ioctl.h when available.
+ * Only define our own structs when the system header doesn't provide them.
+ */
+#ifndef HAVE_IO_URING_CMD
+/* Define structs only when not using io_uring (which includes nvme_ioctl.h) */
+struct mnesia_nvme_uring_cmd {
     __u8  opcode;
     __u8  flags;
     __u16 rsvd1;
@@ -94,7 +100,7 @@ struct nvme_uring_cmd {
 };
 
 /* NVMe passthrough command for ioctl fallback */
-struct nvme_passthru_cmd {
+struct mnesia_nvme_passthru_cmd {
     __u8  opcode;
     __u8  flags;
     __u16 rsvd1;
@@ -114,8 +120,11 @@ struct nvme_passthru_cmd {
     __u32 timeout_ms;
     __u32 result;
 };
+#endif /* !HAVE_IO_URING_CMD */
 
+#ifndef NVME_IOCTL_IO_CMD
 #define NVME_IOCTL_IO_CMD _IOWR('N', 0x43, struct nvme_passthru_cmd)
+#endif
 
 /* Device handle resource */
 typedef struct {
