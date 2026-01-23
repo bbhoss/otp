@@ -19,42 +19,7 @@
 %%
 %% %CopyrightEnd%
 %%
-%% @doc NIF interface for WebAssembly runtime integration.
-%%
-%% This module provides the native interface to a WebAssembly runtime
-%% (such as wasmtime or wasmer) for executing WASM code within the
-%% Erlang VM.
-%%
-%% The module is used internally by `gen_wasmserver' to:
-%% <ul>
-%%   <li>Load and validate WASM modules</li>
-%%   <li>Create and manage WASM instances</li>
-%%   <li>Call exported WASM functions</li>
-%%   <li>Manage WASM memory</li>
-%% </ul>
-%%
-%% == Runtime Selection ==
-%%
-%% The WASM runtime backend can be selected at compile time. Currently
-%% supported backends:
-%% <ul>
-%%   <li>`wasmtime' (default) - Bytecode Alliance's wasmtime</li>
-%%   <li>`wasmer' - Wasmer runtime</li>
-%% </ul>
-%%
-%% == Memory Management ==
-%%
-%% WASM instances are managed using Erlang NIF resources, which ensures
-%% proper cleanup when the owning process terminates. The WASM linear
-%% memory is accessible to the host for data exchange via ETF encoding.
-%%
-%% == Thread Safety ==
-%%
-%% Each WASM instance is isolated and can only be accessed from a single
-%% Erlang process at a time. The NIF uses dirty schedulers for long-running
-%% WASM function calls to avoid blocking regular schedulers.
-%%
-%% @see gen_wasmserver
+%% @doc NIF interface for WebAssembly runtime integration using wasmtime.
 %% @end
 -module(wasm_runtime_nif).
 
@@ -79,95 +44,41 @@
 
 -on_load(init/0).
 
-%% ===================================================================
 %% Types
-%% ===================================================================
-
-%% @type wasm_ref(). Opaque reference to a loaded WASM module instance.
 -opaque wasm_ref() :: reference().
-
-%% @type wasm_error(). Error returned from WASM operations.
 -type wasm_error() :: {error, atom() | {atom(), term()}}.
-
-%% @type export_map(). Map of exported function names to their arities.
 -type export_map() :: #{atom() => arity()}.
-
-%% @type call_options(). Options for WASM function calls.
 -type call_options() :: #{
     timeout => timeout(),
-    fuel => non_neg_integer()  %% Fuel limit for wasmtime
+    fuel => non_neg_integer()
 }.
 
-%% ===================================================================
 %% NIF Loading
-%% ===================================================================
-
 -spec init() -> ok | {error, term()}.
 init() ->
-    %% Try to load the NIF library
-    SoName = case code:priv_dir(wasm_shim) of
+    PrivDir = case code:priv_dir(wasm_shim) of
         {error, bad_name} ->
-            %% Not installed as application, try local path
             case filelib:is_dir("priv") of
-                true ->
-                    "priv/wasm_runtime_nif";
-                false ->
-                    filename:join(["..", "priv", "wasm_runtime_nif"])
+                true -> "priv";
+                false -> "../priv"
             end;
-        Dir ->
-            filename:join(Dir, "wasm_runtime_nif")
+        Dir -> Dir
     end,
+    SoName = filename:join(PrivDir, "wasm_runtime_nif"),
     case erlang:load_nif(SoName, 0) of
         ok -> ok;
         {error, {reload, _}} -> ok;
-        {error, _} = Error ->
-            %% NIF not available, use fallback (stub) implementation
-            error_logger:warning_msg("WASM NIF not loaded: ~p. Using stub implementation.~n", [Error]),
-            ok
+        {error, Reason} ->
+            error({nif_load_failed, Reason})
     end.
 
-%% ===================================================================
 %% Public API
-%% ===================================================================
 
-%% @doc Load a WASM module from binary data.
-%%
-%% Validates, compiles, and instantiates a WASM module. Returns a reference
-%% that can be used to call exported functions.
-%%
-%% == Arguments ==
-%% <ul>
-%%   <li>`WasmBinary' - The compiled WASM module in binary format</li>
-%% </ul>
-%%
-%% == Returns ==
-%% <ul>
-%%   <li>`{ok, Ref, Exports}' on success where:
-%%     <ul>
-%%       <li>`Ref' is an opaque reference to the instance</li>
-%%       <li>`Exports' is a map of exported function names to arities</li>
-%%     </ul>
-%%   </li>
-%%   <li>`{error, Reason}' on failure</li>
-%% </ul>
-%% @end
 -spec load_module(WasmBinary :: binary()) ->
     {ok, wasm_ref(), export_map()} | wasm_error().
 load_module(WasmBinary) ->
     load_module(WasmBinary, #{}).
 
-%% @doc Load a WASM module with options.
-%%
-%% Same as `load_module/1' but with additional configuration options.
-%%
-%% == Options ==
-%% <ul>
-%%   <li>`imports' - Map of host function imports</li>
-%%   <li>`memory_pages' - Initial memory pages (64KB each)</li>
-%%   <li>`max_memory_pages' - Maximum memory pages</li>
-%%   <li>`fuel' - Initial fuel amount (wasmtime only)</li>
-%% </ul>
-%% @end
 -spec load_module(WasmBinary :: binary(), Options :: map()) ->
     {ok, wasm_ref(), export_map()} | wasm_error().
 load_module(WasmBinary, Options) when is_binary(WasmBinary), is_map(Options) ->
@@ -175,46 +86,17 @@ load_module(WasmBinary, Options) when is_binary(WasmBinary), is_map(Options) ->
 load_module(WasmBinary, Options) ->
     error(badarg, [WasmBinary, Options]).
 
-%% @doc Unload a WASM module and free resources.
-%%
-%% After calling this function, the reference is no longer valid.
-%% @end
 -spec unload_module(wasm_ref()) -> ok.
 unload_module(Ref) when is_reference(Ref) ->
     unload_module_nif(Ref);
 unload_module(Ref) ->
     error(badarg, [Ref]).
 
-%% @doc Call an exported function in the WASM module.
-%%
-%% == Arguments ==
-%% <ul>
-%%   <li>`Ref' - Reference to the loaded WASM module</li>
-%%   <li>`Function' - Name of the exported function (atom)</li>
-%%   <li>`Args' - List of binary arguments (ETF encoded)</li>
-%% </ul>
-%%
-%% == Returns ==
-%% <ul>
-%%   <li>`{ok, Result}' where Result is the ETF-encoded return value</li>
-%%   <li>`{error, Reason}' on failure</li>
-%% </ul>
-%% @end
 -spec call_function(wasm_ref(), atom(), [binary()]) ->
     {ok, binary()} | wasm_error().
 call_function(Ref, Function, Args) ->
     call_function(Ref, Function, Args, #{}).
 
-%% @doc Call an exported function with options.
-%%
-%% Same as `call_function/3' but with additional options.
-%%
-%% == Options ==
-%% <ul>
-%%   <li>`timeout' - Call timeout in milliseconds</li>
-%%   <li>`fuel' - Fuel limit for this call (wasmtime)</li>
-%% </ul>
-%% @end
 -spec call_function(wasm_ref(), atom(), [binary()], call_options()) ->
     {ok, binary()} | wasm_error().
 call_function(Ref, Function, Args, Options)
@@ -223,32 +105,12 @@ call_function(Ref, Function, Args, Options)
 call_function(Ref, Function, Args, Options) ->
     error(badarg, [Ref, Function, Args, Options]).
 
-%% @doc Get the map of exported functions from a WASM module.
-%%
-%% Returns a map where keys are function names (atoms) and values
-%% are their arities.
-%% @end
 -spec get_exports(wasm_ref()) -> {ok, export_map()} | wasm_error().
 get_exports(Ref) when is_reference(Ref) ->
     get_exports_nif(Ref);
 get_exports(Ref) ->
     error(badarg, [Ref]).
 
-%% @doc Read data from WASM linear memory.
-%%
-%% == Arguments ==
-%% <ul>
-%%   <li>`Ref' - Reference to the loaded WASM module</li>
-%%   <li>`Offset' - Byte offset into linear memory</li>
-%%   <li>`Length' - Number of bytes to read</li>
-%% </ul>
-%%
-%% == Returns ==
-%% <ul>
-%%   <li>`{ok, Binary}' containing the memory contents</li>
-%%   <li>`{error, Reason}' if the read is out of bounds</li>
-%% </ul>
-%% @end
 -spec get_memory(wasm_ref(), non_neg_integer(), non_neg_integer()) ->
     {ok, binary()} | wasm_error().
 get_memory(Ref, Offset, Length) when is_reference(Ref), is_integer(Offset), is_integer(Length) ->
@@ -256,219 +118,41 @@ get_memory(Ref, Offset, Length) when is_reference(Ref), is_integer(Offset), is_i
 get_memory(Ref, Offset, Length) ->
     error(badarg, [Ref, Offset, Length]).
 
-%% @doc Get memory with offset and length tuple.
-%% @end
 -spec get_memory(wasm_ref(), {non_neg_integer(), non_neg_integer()}) ->
     {ok, binary()} | wasm_error().
 get_memory(Ref, {Offset, Length}) ->
     get_memory(Ref, Offset, Length).
 
-%% @doc Write data to WASM linear memory.
-%%
-%% == Arguments ==
-%% <ul>
-%%   <li>`Ref' - Reference to the loaded WASM module</li>
-%%   <li>`Offset' - Byte offset into linear memory</li>
-%%   <li>`Data' - Binary data to write</li>
-%% </ul>
-%%
-%% == Returns ==
-%% <ul>
-%%   <li>`ok' on success</li>
-%%   <li>`{error, Reason}' if the write is out of bounds</li>
-%% </ul>
-%% @end
 -spec set_memory(wasm_ref(), non_neg_integer(), binary()) -> ok | wasm_error().
 set_memory(Ref, Offset, Data) when is_reference(Ref), is_integer(Offset), is_binary(Data) ->
     set_memory_nif(Ref, Offset, Data);
 set_memory(Ref, Offset, Data) ->
     error(badarg, [Ref, Offset, Data]).
 
-%% @doc Validate a WASM binary without loading it.
-%%
-%% Checks if the binary is a valid WASM module and reports any errors.
-%% Does not create an instance.
-%%
-%% == Returns ==
-%% <ul>
-%%   <li>`ok' if the module is valid</li>
-%%   <li>`{error, Reason}' with validation errors</li>
-%% </ul>
-%% @end
 -spec validate_module(binary()) -> ok | wasm_error().
 validate_module(WasmBinary) when is_binary(WasmBinary) ->
     validate_module_nif(WasmBinary);
 validate_module(WasmBinary) ->
     error(badarg, [WasmBinary]).
 
-%% ===================================================================
-%% NIF Stubs (fallback implementation)
-%% ===================================================================
+%% NIF stubs - these are replaced when the NIF loads
+load_module_nif(_WasmBinary, _Options) ->
+    erlang:nif_error(nif_not_loaded).
 
-%% These functions are replaced by the NIF when loaded.
-%% They provide a minimal stub implementation for testing.
+unload_module_nif(_Ref) ->
+    erlang:nif_error(nif_not_loaded).
 
--spec load_module_nif(binary(), map()) ->
-    {ok, reference(), map()} | {error, term()}.
-load_module_nif(WasmBinary, _Options) ->
-    %% Stub: create a reference and detect exports from WASM header
-    case validate_wasm_header(WasmBinary) of
-        ok ->
-            Ref = make_ref(),
-            %% Store the module data in process dictionary for stub
-            put({wasm_module, Ref}, WasmBinary),
-            Exports = detect_stub_exports(),
-            {ok, Ref, Exports};
-        {error, _} = Error ->
-            Error
-    end.
+call_function_nif(_Ref, _Function, _Args, _Options) ->
+    erlang:nif_error(nif_not_loaded).
 
--spec unload_module_nif(reference()) -> ok.
-unload_module_nif(Ref) ->
-    %% Stub: remove from process dictionary
-    erase({wasm_module, Ref}),
-    ok.
+get_exports_nif(_Ref) ->
+    erlang:nif_error(nif_not_loaded).
 
--spec call_function_nif(reference(), atom(), [binary()], map()) ->
-    {ok, binary()} | {error, term()}.
-call_function_nif(Ref, Function, Args, _Options) ->
-    %% Stub: simulate WASM function calls
-    case get({wasm_module, Ref}) of
-        undefined ->
-            {error, invalid_reference};
-        _WasmBinary ->
-            stub_call_function(Function, Args)
-    end.
+get_memory_nif(_Ref, _OffsetLength) ->
+    erlang:nif_error(nif_not_loaded).
 
--spec get_exports_nif(reference()) -> {ok, map()} | {error, term()}.
-get_exports_nif(Ref) ->
-    case get({wasm_module, Ref}) of
-        undefined ->
-            {error, invalid_reference};
-        _WasmBinary ->
-            {ok, detect_stub_exports()}
-    end.
+set_memory_nif(_Ref, _Offset, _Data) ->
+    erlang:nif_error(nif_not_loaded).
 
--spec get_memory_nif(reference(), {non_neg_integer(), non_neg_integer()}) ->
-    {ok, binary()} | {error, term()}.
-get_memory_nif(Ref, {_Offset, Length}) ->
-    case get({wasm_module, Ref}) of
-        undefined ->
-            {error, invalid_reference};
-        _WasmBinary ->
-            %% Stub: return zeros
-            {ok, <<0:(Length*8)>>}
-    end.
-
--spec set_memory_nif(reference(), non_neg_integer(), binary()) ->
-    ok | {error, term()}.
-set_memory_nif(Ref, _Offset, _Data) ->
-    case get({wasm_module, Ref}) of
-        undefined ->
-            {error, invalid_reference};
-        _WasmBinary ->
-            ok
-    end.
-
--spec validate_module_nif(binary()) -> ok | {error, term()}.
-validate_module_nif(WasmBinary) ->
-    validate_wasm_header(WasmBinary).
-
-%% ===================================================================
-%% Internal Helper Functions
-%% ===================================================================
-
--spec validate_wasm_header(binary()) -> ok | {error, term()}.
-validate_wasm_header(<<16#00, 16#61, 16#73, 16#6D, Version:32/little, _/binary>>)
-  when Version >= 1 ->
-    ok;
-validate_wasm_header(<<16#00, 16#61, 16#73, 16#6D, Version:32/little, _/binary>>) ->
-    {error, {unsupported_version, Version}};
-validate_wasm_header(<<>>) ->
-    {error, empty_module};
-validate_wasm_header(_) ->
-    {error, invalid_magic}.
-
--spec detect_stub_exports() -> export_map().
-detect_stub_exports() ->
-    %% Standard gen_wasmserver exports expected
-    #{wasm_init => 1,
-      wasm_handle_call => 3,
-      wasm_handle_cast => 2,
-      wasm_handle_info => 2,
-      wasm_terminate => 2}.
-
--spec stub_call_function(atom(), [binary()]) -> {ok, binary()} | {error, term()}.
-stub_call_function(wasm_init, [ArgsEncoded]) ->
-    %% Initialize counter with the given value
-    try binary_to_term(ArgsEncoded) of
-        InitialValue when is_integer(InitialValue) ->
-            Result = {ok, InitialValue},
-            {ok, term_to_binary(Result)};
-        Args ->
-            %% Non-integer args, use as-is
-            Result = {ok, Args},
-            {ok, term_to_binary(Result)}
-    catch
-        _:_ ->
-            {error, decode_failed}
-    end;
-stub_call_function(wasm_handle_call, [RequestEncoded, _FromEncoded, StateEncoded]) ->
-    %% Handle call requests - implements counter operations
-    try
-        Request = binary_to_term(RequestEncoded),
-        State = binary_to_term(StateEncoded),
-        Result = handle_call_request(Request, State),
-        {ok, term_to_binary(Result)}
-    catch
-        _:_ ->
-            {error, decode_failed}
-    end;
-stub_call_function(wasm_handle_cast, [RequestEncoded, StateEncoded]) ->
-    %% Handle cast requests - implements counter mutations
-    try
-        Request = binary_to_term(RequestEncoded),
-        State = binary_to_term(StateEncoded),
-        Result = handle_cast_request(Request, State),
-        {ok, term_to_binary(Result)}
-    catch
-        _:_ ->
-            {error, decode_failed}
-    end;
-stub_call_function(wasm_handle_info, [_InfoEncoded, StateEncoded]) ->
-    %% Handle info messages - just maintain state
-    try
-        State = binary_to_term(StateEncoded),
-        Result = {noreply, State},
-        {ok, term_to_binary(Result)}
-    catch
-        _:_ ->
-            {error, decode_failed}
-    end;
-stub_call_function(wasm_terminate, [_ReasonEncoded, _StateEncoded]) ->
-    {ok, term_to_binary(ok)};
-stub_call_function(Function, _Args) ->
-    {error, {unknown_function, Function}}.
-
-%% Counter implementation for stub - mimics what the WASM module does
-handle_call_request(get, State) when is_integer(State) ->
-    {reply, State, State};
-handle_call_request({set, Value}, _State) when is_integer(Value) ->
-    {reply, ok, Value};
-handle_call_request({add, Value}, State) when is_integer(Value), is_integer(State) ->
-    NewState = State + Value,
-    {reply, NewState, NewState};
-handle_call_request(Request, State) ->
-    %% Unknown request - echo it back
-    {reply, {unknown, Request}, State}.
-
-handle_cast_request(increment, State) when is_integer(State) ->
-    {noreply, State + 1};
-handle_cast_request(decrement, State) when is_integer(State) ->
-    {noreply, State - 1};
-handle_cast_request(reset, _State) ->
-    {noreply, 0};
-handle_cast_request({set, Value}, _State) when is_integer(Value) ->
-    {noreply, Value};
-handle_cast_request(_Request, State) ->
-    {noreply, State}.
+validate_module_nif(_WasmBinary) ->
+    erlang:nif_error(nif_not_loaded).

@@ -90,8 +90,7 @@ run_tests(Pid) ->
     io:format("================================================================~n"),
     io:format("    All Tests Completed!~n"),
     io:format("~n"),
-    io:format("    NOTE: Currently using STUB implementation (echoes requests).~n"),
-    io:format("    For real WASM execution, build the wasm_runtime_nif with~n"),
-    io:format("    wasmtime or wasmer integration.~n"),
+    io:format("    Running REAL WASM code via wasmtime NIF integration.~n"),
+    io:format("    The Rust counter module is executing in the WASM runtime.~n"),
     io:format("================================================================~n~n"),
     ok.
