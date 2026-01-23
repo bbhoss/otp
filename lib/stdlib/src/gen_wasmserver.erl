@@ -20,45 +20,7 @@
 %% %CopyrightEnd%
 %%
 -module(gen_wasmserver).
--moduledoc """
-Generic WASM server behavior.
-
-This behavior module provides a server that executes WebAssembly (WASM)
-code for handling requests. It follows the same patterns as `gen_server`
-but routes callbacks to exported WASM functions instead of Erlang callbacks.
-
-A `gen_wasmserver` process is initialized with a WASM binary that must
-export the following functions according to the WASI Component Model:
-
-```
-  wasm-init(args: list<u8>) -> result<list<u8>, string>
-  wasm-handle-call(request: list<u8>, from: list<u8>, state: list<u8>) -> result<call-result, string>
-  wasm-handle-cast(request: list<u8>, state: list<u8>) -> result<cast-result, string>
-  wasm-handle-info(info: list<u8>, state: list<u8>) -> result<cast-result, string>
-  wasm-terminate(reason: list<u8>, state: list<u8>) -> result<unit, string>
-```
-
-The Erlang terms are encoded using the External Term Format (ETF) before
-being passed to the WASM functions, and decoded from ETF when returned.
-
-## Example
-
-```erlang
-%% Load and start a WASM server
-{ok, WasmBinary} = file:read_file("my_server.wasm"),
-{ok, Pid} = gen_wasmserver:start_link(WasmBinary, InitArgs, []).
-
-%% Make calls to the WASM server
-Reply = gen_wasmserver:call(Pid, {get_value, key}).
-
-%% Cast messages
-ok = gen_wasmserver:cast(Pid, {set_value, key, value}).
-```
-
-## See Also
-
-`m:gen_server`, `m:gen_statem`
-""".
+-moduledoc false.
 
 %%% ---------------------------------------------------
 %%%
@@ -160,31 +122,22 @@ ok = gen_wasmserver:cast(Pid, {set_value, key, value}).
 %%%  Type Definitions
 %%%=========================================================================
 
--doc "Binary containing compiled WASM code (WebAssembly binary format).".
+
 -type wasm_binary() :: binary().
 
--doc "Opaque state managed by the WASM module, encoded as ETF binary.".
+
 -type wasm_state() :: binary().
 
--doc """
-A call's reply destination.
 
-Destination, given to the WASM server for handle_call,
-to be used when replying through `reply/2`.
-""".
 -type from() :: {Client :: pid(), Tag :: gen:reply_tag()}.
 
--doc """
-Server name specification: `local`, `global`, or `via` registered.
-""".
+
 -type server_name() ::
         {'local', LocalName :: atom()}
       | {'global', GlobalName :: term()}
       | {'via', RegMod :: module(), ViaName :: term()}.
 
--doc """
-Server specification: `t:pid/0` or registered `t:server_name/0`.
-""".
+
 -type server_ref() ::
         pid()
       | (LocalName :: atom())
@@ -192,26 +145,20 @@ Server specification: `t:pid/0` or registered `t:server_name/0`.
       | {'global', GlobalName :: term()}
       | {'via', RegMod :: module(), ViaName :: term()}.
 
--doc """
-Server start options.
-""".
+
 -type start_opt() ::
         {'timeout', Timeout :: timeout()}
       | {'spawn_opt', SpawnOptions :: [proc_lib:start_spawn_option()]}
       | {'hibernate_after', HibernateAfterTimeout :: timeout()}
       | {'debug', Dbgs :: [sys:debug_option()]}.
 
--doc """
-Return value from start functions.
-""".
+
 -type start_ret() ::
         {'ok', Pid :: pid()}
       | 'ignore'
       | {'error', Reason :: term()}.
 
--doc """
-Return value from start_monitor functions.
-""".
+
 -type start_mon_ret() ::
         {'ok', {Pid :: pid(), MonRef :: reference()}}
       | 'ignore'
@@ -221,16 +168,7 @@ Return value from start_monitor functions.
 %%%  API
 %%%=========================================================================
 
--doc """
-Start a WASM server, neither linked nor registered.
 
-Starts a standalone `gen_wasmserver` process with the given WASM binary.
-
-`WasmBinary` is the compiled WebAssembly module that must export the
-required callback functions.
-
-`Args` are passed to the WASM module's `wasm_init` function after ETF encoding.
-""".
 -spec start(
         WasmBinary :: wasm_binary(),
         Args :: term(),
@@ -242,9 +180,7 @@ start(WasmBinary, Args, Options)
 start(WasmBinary, Args, Options) ->
     error(badarg, [WasmBinary, Args, Options]).
 
--doc """
-Start a WASM server, registered but not linked.
-""".
+
 -spec start(
         ServerName :: server_name(),
         WasmBinary :: wasm_binary(),
@@ -257,11 +193,7 @@ start(ServerName, WasmBinary, Args, Options)
 start(ServerName, WasmBinary, Args, Options) ->
     error(badarg, [ServerName, WasmBinary, Args, Options]).
 
--doc """
-Start a WASM server, linked but not registered.
 
-Creates a `gen_wasmserver` process as part of a supervision tree.
-""".
 -spec start_link(
         WasmBinary :: wasm_binary(),
         Args :: term(),
@@ -273,9 +205,7 @@ start_link(WasmBinary, Args, Options)
 start_link(WasmBinary, Args, Options) ->
     error(badarg, [WasmBinary, Args, Options]).
 
--doc """
-Start a WASM server, linked and registered.
-""".
+
 -spec start_link(
         ServerName :: server_name(),
         WasmBinary :: wasm_binary(),
@@ -288,9 +218,7 @@ start_link(ServerName, WasmBinary, Args, Options)
 start_link(ServerName, WasmBinary, Args, Options) ->
     error(badarg, [ServerName, WasmBinary, Args, Options]).
 
--doc """
-Start a WASM server, monitored but not linked or registered.
-""".
+
 -spec start_monitor(
         WasmBinary :: wasm_binary(),
         Args :: term(),
@@ -302,9 +230,7 @@ start_monitor(WasmBinary, Args, Options)
 start_monitor(WasmBinary, Args, Options) ->
     error(badarg, [WasmBinary, Args, Options]).
 
--doc """
-Start a WASM server, monitored and registered.
-""".
+
 -spec start_monitor(
         ServerName :: server_name(),
         WasmBinary :: wasm_binary(),
@@ -317,12 +243,7 @@ start_monitor(ServerName, WasmBinary, Args, Options)
 start_monitor(ServerName, WasmBinary, Args, Options) ->
     error(badarg, [ServerName, WasmBinary, Args, Options]).
 
--doc """
-Stop a WASM server.
 
-Orders the `gen_wasmserver` specified by `ServerRef` to exit with
-the specified `Reason` and waits for it to terminate.
-""".
 -spec stop(ServerRef :: server_ref()) -> ok.
 stop(ServerRef) ->
     gen:stop(ServerRef).
@@ -335,13 +256,7 @@ stop(ServerRef) ->
 stop(ServerRef, Reason, Timeout) ->
     gen:stop(ServerRef, Reason, Timeout).
 
--doc """
-Call a WASM server.
 
-Makes a synchronous call to the `gen_wasmserver` process and waits
-for its reply. The request is encoded to ETF and passed to the WASM
-module's `wasm_handle_call` function.
-""".
 -spec call(ServerRef :: server_ref(), Request :: term()) -> Reply :: term().
 call(ServerRef, Request) ->
     case catch gen:call(ServerRef, '$gen_call', Request) of
@@ -367,12 +282,7 @@ call(ServerRef, Request, Timeout)
 call(ServerRef, Request, Timeout) ->
     error(badarg, [ServerRef, Request, Timeout]).
 
--doc """
-Cast a request to a WASM server.
 
-Sends an asynchronous request to the `gen_wasmserver` and returns
-`ok` immediately, ignoring if the destination does not exist.
-""".
 -spec cast(ServerRef :: server_ref(), Request :: term()) -> ok.
 cast({global,Name}, Request) ->
     catch global:send(Name, cast_msg(Request)),
@@ -393,13 +303,7 @@ do_cast(Dest, Request) ->
 
 cast_msg(Request) -> {'$gen_cast', Request}.
 
--doc """
-Send a reply to a client.
 
-This function can be used by the WASM callback handler to explicitly
-send a reply to a client when the reply cannot be passed in the
-return value of wasm_handle_call.
-""".
 -spec reply(Client :: from(), Reply :: term()) -> ok.
 reply(Client, Reply) ->
     gen:reply(Client, Reply).
@@ -412,7 +316,7 @@ reply(Client, Reply) ->
 %%% Initiate the new process.
 %%% Load the WASM binary and call wasm_init.
 %%% ---------------------------------------------------
--doc false.
+
 init_it(Starter, self, Name, Mod, Args, Options) ->
     init_it(Starter, self(), Name, Mod, Args, Options);
 init_it(Starter, Parent, Name0, _Mod, {WasmBinary, Args}, Options) ->
@@ -495,7 +399,7 @@ loop(ServerData, State, Time, Debug) when ?is_timeout(Time) ->
 loop_hibernate(ServerData, State, Debug) ->
     erlang:hibernate(?MODULE, loop_wakeup, [ServerData, State, Debug]).
 
--doc false.
+
 loop_wakeup(ServerData, State, Debug) ->
     receive
         Msg ->
@@ -679,25 +583,25 @@ do_send(Dest, Msg) ->
 %%% System callbacks
 %%% ---------------------------------------------------
 
--doc false.
+
 system_continue(Parent, Debug, [#wasm_server_data{parent = Parent} = ServerData, State, HibT]) ->
     loop(ServerData, State, HibT, Debug).
 
--doc false.
+
 -spec system_terminate(_, _, _, _) -> no_return().
 system_terminate(Reason, _Parent, Debug, [ServerData, State, _HibT]) ->
     terminate(ServerData, State, [], undefined, Reason, ?STACKTRACE(), Debug).
 
--doc false.
+
 system_code_change([ServerData, State, HibT], _Module, _OldVsn, _Extra) ->
     %% WASM modules don't support code change in the traditional sense
     {ok, [ServerData, State, HibT]}.
 
--doc false.
+
 system_get_state([_ServerData, State, _HibT]) ->
     {ok, State}.
 
--doc false.
+
 system_replace_state(StateFun, [ServerData, State, HibT]) ->
     NState = StateFun(State),
     {ok, NState, [ServerData, NState, HibT]}.
@@ -725,7 +629,7 @@ print_event(Dev, {noreply, State}, Name) ->
 print_event(Dev, Event, Name) ->
     io:format(Dev, "*DBG* ~tp event ~tp~n", [Name, Event]).
 
--doc false.
+
 format_status(Opt, StatusData) ->
     [PDict, SysState, Parent, Debug, [ServerData, State, _HibT]] = StatusData,
     #wasm_server_data{name = Name} = ServerData,
@@ -748,7 +652,7 @@ format_status(Opt, StatusData) ->
 %%% Logger formatting
 %%% ---------------------------------------------------
 
--doc false.
+
 format_log(Report) ->
     Depth = error_logger:get_format_depth(),
     FormatOpts = #{chars_limit => unlimited,
@@ -757,7 +661,7 @@ format_log(Report) ->
                    encoding => utf8},
     format_log_multi(limit_report(Report, Depth), FormatOpts).
 
--doc false.
+
 format_log(Report, FormatOpts0) ->
     Default = #{chars_limit => unlimited,
                 depth => error_logger:get_format_depth(),

@@ -1,17 +1,17 @@
 # Cargo configuration for Rust WASM counter example
 
 [build]
-# Default target is WASM
-target = "wasm32-unknown-unknown"
+# Default target is WASM with WASI (has std library support)
+target = "wasm32-wasip1"
 
-[target.wasm32-unknown-unknown]
+[target.wasm32-wasip1]
 # Linker flags for WASM
 rustflags = [
     "-C", "link-arg=--export-dynamic",
 ]
 
-[target.wasm32-wasi]
-# Alternative WASI target
+[target.wasm32-unknown-unknown]
+# Alternative pure WASM target (no std)
 rustflags = [
     "-C", "link-arg=--export-dynamic",
 ]

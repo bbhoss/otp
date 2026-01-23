@@ -9,11 +9,13 @@ license = "Apache-2.0"
 crate-type = ["cdylib"]
 
 [dependencies]
-# No external dependencies - we implement ETF encoding ourselves
+# Use the eetf crate for Erlang External Term Format
+eetf = "0.11"
+# For ToPrimitive trait (converting BigInteger to i64)
+num-traits = "0.2"
 
 [profile.release]
 opt-level = "s"        # Optimize for size
 lto = true             # Link-time optimization
 codegen-units = 1      # Better optimization
-panic = "abort"        # No unwinding needed in WASM
 strip = true           # Strip symbols

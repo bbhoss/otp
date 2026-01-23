@@ -20,54 +20,8 @@
 %% %CopyrightEnd%
 %%
 -module(rust_counter_example).
--moduledoc """
-Example usage of gen_wasmserver with a Rust-based counter server.
-
-This module demonstrates how to use gen_wasmserver with a WASM module
-implemented in Rust. The Rust counter server provides additional
-operations compared to the C version.
-
-## Building the Rust WASM Module
-
-```bash
-cd rust_counter
-cargo build --release --target wasm32-unknown-unknown
-# Output: target/wasm32-unknown-unknown/release/rust_counter.wasm
-```
-
-## Quick Start
-
-```erlang
-%% Start the counter server with initial value 0
-{ok, Pid} = rust_counter_example:start().
-
-%% Get current value
-0 = rust_counter_example:get(Pid).
-
-%% Increment the counter
-ok = rust_counter_example:increment(Pid).
-1 = rust_counter_example:get(Pid).
-
-%% Use multiplication (Rust-specific feature)
-ok = rust_counter_example:multiply(Pid, 10).
-10 = rust_counter_example:get(Pid).
-
-%% Atomic add with return value
-13 = rust_counter_example:add(Pid, 3).
-
-%% Stop the server
-ok = rust_counter_example:stop(Pid).
-```
-
-## Comparison with C Counter
-
-The Rust counter adds the following operations:
-- `multiply/2` - Multiply the counter by a value
-- `add/2` - Add a value and return the new counter (synchronous)
-
-Both implementations share:
-- `get/1`, `set/2`, `increment/1,2`, `decrement/1,2`, `reset/1`
-""".
+-compile({no_auto_import, [get/1]}).
+-moduledoc false.
 
 -export([start/0, start/1, start_link/0, start_link/1, stop/1]).
 -export([get/1, set/2, add/2]).
@@ -81,16 +35,12 @@ Both implementations share:
 %% API Functions
 %% ===================================================================
 
--doc """
-Start a Rust counter server with initial value 0.
-""".
+
 -spec start() -> {ok, pid()} | {error, term()}.
 start() ->
     start(0).
 
--doc """
-Start a Rust counter server with the given initial value.
-""".
+
 -spec start(InitialValue :: integer()) -> {ok, pid()} | {error, term()}.
 start(InitialValue) when is_integer(InitialValue) ->
     case load_wasm_binary() of
@@ -100,16 +50,12 @@ start(InitialValue) when is_integer(InitialValue) ->
             Error
     end.
 
--doc """
-Start a Rust counter server linked to the calling process.
-""".
+
 -spec start_link() -> {ok, pid()} | {error, term()}.
 start_link() ->
     start_link(0).
 
--doc """
-Start a linked Rust counter server with the given initial value.
-""".
+
 -spec start_link(InitialValue :: integer()) -> {ok, pid()} | {error, term()}.
 start_link(InitialValue) when is_integer(InitialValue) ->
     case load_wasm_binary() of
@@ -119,9 +65,7 @@ start_link(InitialValue) when is_integer(InitialValue) ->
             Error
     end.
 
--doc """
-Stop the counter server.
-""".
+
 -spec stop(pid()) -> ok.
 stop(Pid) ->
     gen_wasmserver:stop(Pid).
@@ -130,25 +74,17 @@ stop(Pid) ->
 %% Synchronous Operations (calls)
 %% -------------------------------------------------------------------
 
--doc """
-Get the current counter value.
-""".
+
 -spec get(pid()) -> integer().
 get(Pid) ->
     gen_wasmserver:call(Pid, get).
 
--doc """
-Set the counter to a specific value. Returns the old value.
-""".
+
 -spec set(pid(), integer()) -> integer().
 set(Pid, Value) when is_integer(Value) ->
     gen_wasmserver:call(Pid, {set, Value}).
 
--doc """
-Add a value to the counter. Returns the new value.
 
-This is an atomic operation that returns the result immediately.
-""".
 -spec add(pid(), integer()) -> integer().
 add(Pid, N) when is_integer(N) ->
     gen_wasmserver:call(Pid, {add, N}).
@@ -157,46 +93,32 @@ add(Pid, N) when is_integer(N) ->
 %% Asynchronous Operations (casts)
 %% -------------------------------------------------------------------
 
--doc """
-Increment the counter by 1.
-""".
+
 -spec increment(pid()) -> ok.
 increment(Pid) ->
     gen_wasmserver:cast(Pid, increment).
 
--doc """
-Increment the counter by N.
-""".
+
 -spec increment(pid(), integer()) -> ok.
 increment(Pid, N) when is_integer(N) ->
     gen_wasmserver:cast(Pid, {increment, N}).
 
--doc """
-Decrement the counter by 1.
-""".
+
 -spec decrement(pid()) -> ok.
 decrement(Pid) ->
     gen_wasmserver:cast(Pid, decrement).
 
--doc """
-Decrement the counter by N.
-""".
+
 -spec decrement(pid(), integer()) -> ok.
 decrement(Pid, N) when is_integer(N) ->
     gen_wasmserver:cast(Pid, {decrement, N}).
 
--doc """
-Multiply the counter by N.
 
-This operation is only available in the Rust implementation.
-""".
 -spec multiply(pid(), integer()) -> ok.
 multiply(Pid, N) when is_integer(N) ->
     gen_wasmserver:cast(Pid, {multiply, N}).
 
--doc """
-Reset the counter to its initial value.
-""".
+
 -spec reset(pid()) -> ok.
 reset(Pid) ->
     gen_wasmserver:cast(Pid, reset).
@@ -205,12 +127,7 @@ reset(Pid) ->
 %% Demo Function
 %% ===================================================================
 
--doc """
-Run a demonstration of the Rust counter server.
 
-This function shows all the operations available, including
-Rust-specific features like multiply.
-""".
 -spec demo() -> ok.
 demo() ->
     io:format("~n=== Rust Counter Server Demo ===~n~n"),
