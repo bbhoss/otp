@@ -1,0 +1,310 @@
+// gen-wasmserver.wit
+//
+// WebAssembly Interface Types (WIT) definition for Erlang gen_wasmserver.
+// This defines the interface that WASM components must implement to be
+// used with gen_wasmserver in the Erlang/OTP runtime.
+//
+// The interface uses External Term Format (ETF) encoded data for all
+// Erlang term communications. This allows full fidelity transfer of
+// Erlang data types to and from WASM code.
+
+package erlang:gen-wasmserver@1.0.0;
+
+/// Types used throughout the gen_wasmserver interface.
+interface types {
+    /// ETF-encoded Erlang term as a byte sequence.
+    ///
+    /// All Erlang data is serialized using the External Term Format (ETF)
+    /// before being passed to WASM functions. The ETF binary starts with
+    /// version byte 131, followed by the encoded term.
+    type etf-term = list<u8>;
+
+    /// Server state, stored as an ETF-encoded term.
+    ///
+    /// The state is opaque to the runtime and managed entirely by the
+    /// WASM module. It must be serializable to ETF format.
+    type state = etf-term;
+
+    /// Timeout value in milliseconds.
+    type timeout-ms = u32;
+
+    /// Reply destination for synchronous calls.
+    ///
+    /// This is an ETF-encoded tuple of {pid(), reference()} that identifies
+    /// the caller process and the specific call request.
+    type from = etf-term;
+
+    /// Error description as a string.
+    type error-string = string;
+
+    /// Result type for initialization.
+    variant init-result {
+        /// Successful initialization with state.
+        ok(state),
+        /// Successful initialization with state and timeout.
+        ok-timeout(tuple<state, timeout-ms>),
+        /// Successful initialization with state and hibernate.
+        ok-hibernate(state),
+        /// Stop initialization with reason.
+        stop(etf-term),
+        /// Error during initialization.
+        error(etf-term),
+        /// Ignore this server start attempt.
+        ignore,
+    }
+
+    /// Result type for handle-call callback.
+    variant call-result {
+        /// Reply with value and new state.
+        reply(tuple<etf-term, state>),
+        /// Reply with value, new state, and timeout.
+        reply-timeout(tuple<etf-term, state, timeout-ms>),
+        /// Reply with value, new state, and hibernate.
+        reply-hibernate(tuple<etf-term, state>),
+        /// No reply yet, with new state.
+        noreply(state),
+        /// No reply yet, with new state and timeout.
+        noreply-timeout(tuple<state, timeout-ms>),
+        /// No reply yet, with new state and hibernate.
+        noreply-hibernate(state),
+        /// Stop with reason, reply, and final state.
+        stop-reply(tuple<etf-term, etf-term, state>),
+        /// Stop with reason and final state.
+        stop(tuple<etf-term, state>),
+    }
+
+    /// Result type for handle-cast and handle-info callbacks.
+    variant cast-result {
+        /// Continue with new state.
+        noreply(state),
+        /// Continue with new state and timeout.
+        noreply-timeout(tuple<state, timeout-ms>),
+        /// Continue with new state and hibernate.
+        noreply-hibernate(state),
+        /// Stop with reason and final state.
+        stop(tuple<etf-term, state>),
+    }
+}
+
+/// The main gen_wasmserver interface that WASM components must implement.
+///
+/// This interface mirrors the callbacks of Erlang's gen_server behavior
+/// but operates on ETF-encoded data.
+interface callbacks {
+    use types.{etf-term, state, from, timeout-ms, init-result, call-result, cast-result, error-string};
+
+    /// Initialize the server state.
+    ///
+    /// Called when the gen_wasmserver process starts. The args parameter
+    /// contains the ETF-encoded initialization arguments passed to
+    /// gen_wasmserver:start/3,4 or gen_wasmserver:start_link/3,4.
+    ///
+    /// # Arguments
+    /// * `args` - ETF-encoded initialization arguments
+    ///
+    /// # Returns
+    /// * `init-result` on success describing initial state
+    /// * `error-string` on failure with error description
+    wasm-init: func(args: etf-term) -> result<init-result, error-string>;
+
+    /// Handle a synchronous call.
+    ///
+    /// Called when gen_wasmserver:call/2,3 is invoked. The request is
+    /// the ETF-encoded message from the caller, and from identifies
+    /// the caller for potential later reply via gen_wasmserver:reply/2.
+    ///
+    /// # Arguments
+    /// * `request` - ETF-encoded request from the caller
+    /// * `from` - ETF-encoded caller identifier {pid(), tag()}
+    /// * `current-state` - Current server state
+    ///
+    /// # Returns
+    /// * `call-result` describing the reply and new state
+    /// * `error-string` on unrecoverable error
+    wasm-handle-call: func(
+        request: etf-term,
+        from: from,
+        current-state: state
+    ) -> result<call-result, error-string>;
+
+    /// Handle an asynchronous cast.
+    ///
+    /// Called when gen_wasmserver:cast/2 is invoked. Casts are
+    /// fire-and-forget messages that don't expect a reply.
+    ///
+    /// # Arguments
+    /// * `request` - ETF-encoded cast message
+    /// * `current-state` - Current server state
+    ///
+    /// # Returns
+    /// * `cast-result` describing the new state
+    /// * `error-string` on unrecoverable error
+    wasm-handle-cast: func(
+        request: etf-term,
+        current-state: state
+    ) -> result<cast-result, error-string>;
+
+    /// Handle other messages (info).
+    ///
+    /// Called for all messages that are not calls or casts. This includes
+    /// timeout messages, process monitors, and any other Erlang messages
+    /// sent directly to the server process.
+    ///
+    /// # Arguments
+    /// * `info` - ETF-encoded message
+    /// * `current-state` - Current server state
+    ///
+    /// # Returns
+    /// * `cast-result` describing the new state
+    /// * `error-string` on unrecoverable error
+    wasm-handle-info: func(
+        info: etf-term,
+        current-state: state
+    ) -> result<cast-result, error-string>;
+
+    /// Handle server termination.
+    ///
+    /// Called when the server is about to terminate. This is the place
+    /// to clean up any external resources. The return value is ignored
+    /// by the runtime, but errors should still be reported.
+    ///
+    /// # Arguments
+    /// * `reason` - ETF-encoded termination reason
+    /// * `final-state` - Server state at termination time
+    ///
+    /// # Returns
+    /// * Unit on success
+    /// * `error-string` on cleanup failure
+    wasm-terminate: func(
+        reason: etf-term,
+        final-state: state
+    ) -> result<_, error-string>;
+}
+
+/// Host functions provided by the Erlang runtime to WASM components.
+///
+/// These functions allow WASM code to interact with the Erlang runtime,
+/// send messages, access process information, etc.
+interface host {
+    use types.{etf-term, from, error-string};
+
+    /// Send a reply to a pending call.
+    ///
+    /// This function can be used to reply to a call from within
+    /// handle_cast or handle_info, or to defer a reply from handle_call.
+    ///
+    /// # Arguments
+    /// * `client` - The from parameter from handle_call
+    /// * `reply` - ETF-encoded reply term
+    ///
+    /// # Returns
+    /// * Unit on success
+    /// * `error-string` if the client is no longer reachable
+    send-reply: func(client: from, reply: etf-term) -> result<_, error-string>;
+
+    /// Get the current server's process ID.
+    ///
+    /// # Returns
+    /// * ETF-encoded PID
+    self-pid: func() -> etf-term;
+
+    /// Log a message at the specified level.
+    ///
+    /// # Arguments
+    /// * `level` - Log level: "debug", "info", "notice", "warning", "error", "critical", "alert", "emergency"
+    /// * `message` - Log message as a string
+    log: func(level: string, message: string);
+
+    /// Send a message to another process.
+    ///
+    /// # Arguments
+    /// * `dest` - ETF-encoded destination (pid or registered name)
+    /// * `message` - ETF-encoded message to send
+    ///
+    /// # Returns
+    /// * Unit on success
+    /// * `error-string` if sending fails
+    send-message: func(dest: etf-term, message: etf-term) -> result<_, error-string>;
+
+    /// Get the current monotonic time in milliseconds.
+    ///
+    /// # Returns
+    /// * Current monotonic time
+    monotonic-time-ms: func() -> u64;
+
+    /// Generate a unique reference.
+    ///
+    /// # Returns
+    /// * ETF-encoded reference
+    make-ref: func() -> etf-term;
+}
+
+/// The complete gen_wasmserver world combining all interfaces.
+world gen-wasmserver {
+    /// Import host functions from the Erlang runtime.
+    import host;
+
+    /// Export the callback functions that the WASM module must implement.
+    export callbacks;
+}
+
+/// Optional extensions that WASM components may implement.
+interface extensions {
+    use types.{etf-term, state, error-string};
+
+    /// Handle code change (hot code loading).
+    ///
+    /// Called during a code upgrade when the server needs to transform
+    /// its state from the old version to the new version.
+    ///
+    /// # Arguments
+    /// * `old-vsn` - ETF-encoded old version info
+    /// * `current-state` - Current server state
+    /// * `extra` - ETF-encoded extra data from the upgrade
+    ///
+    /// # Returns
+    /// * New state on success
+    /// * `error-string` on failure
+    wasm-code-change: func(
+        old-vsn: etf-term,
+        current-state: state,
+        extra: etf-term
+    ) -> result<state, error-string>;
+
+    /// Format status for debugging.
+    ///
+    /// Called when sys:get_status/1,2 is invoked on the server.
+    ///
+    /// # Arguments
+    /// * `opt` - Either "normal" or "terminate"
+    /// * `current-state` - Current server state
+    ///
+    /// # Returns
+    /// * ETF-encoded formatted status
+    wasm-format-status: func(
+        opt: string,
+        current-state: state
+    ) -> etf-term;
+
+    /// Handle continue action.
+    ///
+    /// Called when the previous callback returns {continue, Continue}.
+    ///
+    /// # Arguments
+    /// * `continue-arg` - ETF-encoded continue argument
+    /// * `current-state` - Current server state
+    ///
+    /// # Returns
+    /// * cast-result describing the new state
+    /// * `error-string` on failure
+    wasm-handle-continue: func(
+        continue-arg: etf-term,
+        current-state: state
+    ) -> result<types.cast-result, error-string>;
+}
+
+/// World with optional extensions.
+world gen-wasmserver-extended {
+    include gen-wasmserver;
+    export extensions;
+}
