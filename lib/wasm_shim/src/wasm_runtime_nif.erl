@@ -400,9 +400,13 @@ detect_stub_exports() ->
 
 -spec stub_call_function(atom(), [binary()]) -> {ok, binary()} | {error, term()}.
 stub_call_function(wasm_init, [ArgsEncoded]) ->
-    %% Stub: return {ok, Args} as initial state
+    %% Initialize counter with the given value
     try binary_to_term(ArgsEncoded) of
+        InitialValue when is_integer(InitialValue) ->
+            Result = {ok, InitialValue},
+            {ok, term_to_binary(Result)};
         Args ->
+            %% Non-integer args, use as-is
             Result = {ok, Args},
             {ok, term_to_binary(Result)}
     catch
@@ -410,28 +414,29 @@ stub_call_function(wasm_init, [ArgsEncoded]) ->
             {error, decode_failed}
     end;
 stub_call_function(wasm_handle_call, [RequestEncoded, _FromEncoded, StateEncoded]) ->
-    %% Stub: echo the request back as reply
+    %% Handle call requests - implements counter operations
     try
         Request = binary_to_term(RequestEncoded),
         State = binary_to_term(StateEncoded),
-        Result = {reply, {echo, Request}, State},
+        Result = handle_call_request(Request, State),
         {ok, term_to_binary(Result)}
     catch
         _:_ ->
             {error, decode_failed}
     end;
-stub_call_function(wasm_handle_cast, [_RequestEncoded, StateEncoded]) ->
-    %% Stub: just return state unchanged
+stub_call_function(wasm_handle_cast, [RequestEncoded, StateEncoded]) ->
+    %% Handle cast requests - implements counter mutations
     try
+        Request = binary_to_term(RequestEncoded),
         State = binary_to_term(StateEncoded),
-        Result = {noreply, State},
+        Result = handle_cast_request(Request, State),
         {ok, term_to_binary(Result)}
     catch
         _:_ ->
             {error, decode_failed}
     end;
 stub_call_function(wasm_handle_info, [_InfoEncoded, StateEncoded]) ->
-    %% Stub: just return state unchanged
+    %% Handle info messages - just maintain state
     try
         State = binary_to_term(StateEncoded),
         Result = {noreply, State},
@@ -444,3 +449,26 @@ stub_call_function(wasm_terminate, [_ReasonEncoded, _StateEncoded]) ->
     {ok, term_to_binary(ok)};
 stub_call_function(Function, _Args) ->
     {error, {unknown_function, Function}}.
+
+%% Counter implementation for stub - mimics what the WASM module does
+handle_call_request(get, State) when is_integer(State) ->
+    {reply, State, State};
+handle_call_request({set, Value}, _State) when is_integer(Value) ->
+    {reply, ok, Value};
+handle_call_request({add, Value}, State) when is_integer(Value), is_integer(State) ->
+    NewState = State + Value,
+    {reply, NewState, NewState};
+handle_call_request(Request, State) ->
+    %% Unknown request - echo it back
+    {reply, {unknown, Request}, State}.
+
+handle_cast_request(increment, State) when is_integer(State) ->
+    {noreply, State + 1};
+handle_cast_request(decrement, State) when is_integer(State) ->
+    {noreply, State - 1};
+handle_cast_request(reset, _State) ->
+    {noreply, 0};
+handle_cast_request({set, Value}, _State) when is_integer(Value) ->
+    {noreply, Value};
+handle_cast_request(_Request, State) ->
+    {noreply, State}.
