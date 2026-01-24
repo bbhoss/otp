@@ -1,0 +1,21 @@
+[package]
+name = "rust_counter"
+version = "0.1.0"
+edition = "2021"
+description = "Example gen_wasmserver implementation in Rust"
+license = "Apache-2.0"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# Use the eetf crate for Erlang External Term Format
+eetf = "0.11"
+# For ToPrimitive trait (converting BigInteger to i64)
+num-traits = "0.2"
+
+[profile.release]
+opt-level = "s"        # Optimize for size
+lto = true             # Link-time optimization
+codegen-units = 1      # Better optimization
+strip = true           # Strip symbols

@@ -1,0 +1,12 @@
+# Build artifacts
+priv/
+ebin/
+
+# Rust build artifacts
+native/wasm_runtime/target/
+examples/rust_counter/target/
+
+# Temporary files
+*.o
+*.so
+*.dylib

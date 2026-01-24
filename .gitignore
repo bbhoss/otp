@@ -353,3 +353,4 @@ JAVADOC-GENERATED
 /lib/xmerl/src/xmerl_xpath_parse.erl
 /lib/xmerl/test/xmerl_test.erl
 
+lib/wasm_shim/examples/rust_counter/target/
