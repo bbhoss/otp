@@ -36,7 +36,7 @@ WIT_DIR = wit
 PRIV_DIR = priv
 EBIN_DIR = ebin
 EXAMPLES_DIR = examples
-C_SRC_DIR = c_src
+NATIVE_DIR = native/wasm_runtime
 
 # Compilers and tools
 CC ?= gcc
@@ -73,7 +73,6 @@ WASM_CFLAGS = -O2 -Wall -I$(INCLUDE_DIR) \
 
 # Source files
 WASM_SHIM_SRCS = $(SRC_DIR)/erl_wasm_shim.c
-NIF_SRCS = $(C_SRC_DIR)/wasm_runtime_nif.c
 ERL_SRCS = $(wildcard $(SRC_DIR)/*.erl)
 ERL_BEAMS = $(patsubst $(SRC_DIR)/%.erl,$(EBIN_DIR)/%.beam,$(ERL_SRCS))
 
@@ -106,11 +105,12 @@ $(WASM_SHIM_LIB): $(WASM_SHIM_SRCS)
 $(WASM_SHIM_WASM): $(WASM_SHIM_SRCS)
 	$(WASM_CC) $(WASM_CFLAGS) $< -o $@
 
-# Build NIF library (requires wasmtime-c-api or similar)
-nif: dirs $(NIF_LIB)
-
-$(NIF_LIB): $(NIF_SRCS)
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $<
+# Build NIF library using Rust
+nif: dirs
+	cd $(NATIVE_DIR) && cargo build --release
+	cp $(NATIVE_DIR)/target/release/libwasm_runtime_nif.so $(NIF_LIB) 2>/dev/null || \
+	cp $(NATIVE_DIR)/target/release/libwasm_runtime_nif.dylib $(NIF_LIB) 2>/dev/null || \
+	echo "Failed to copy NIF library"
 
 # Generate WIT bindings (optional, for component model)
 wit-bindings: $(WIT_DIR)/gen-wasmserver.wit
@@ -129,7 +129,7 @@ examples: erlang
 # Clean build artifacts
 clean:
 	rm -rf $(PRIV_DIR) $(EBIN_DIR)
-	rm -f $(C_SRC_DIR)/*.o
+	cd $(NATIVE_DIR) && cargo clean 2>/dev/null || true
 	@if [ -d $(EXAMPLES_DIR) ]; then \
 		$(MAKE) -C $(EXAMPLES_DIR) clean; \
 	fi

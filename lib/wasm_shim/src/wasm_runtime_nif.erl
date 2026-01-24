@@ -101,7 +101,10 @@ call_function(Ref, Function, Args) ->
     {ok, binary()} | wasm_error().
 call_function(Ref, Function, Args, Options)
   when is_reference(Ref), is_atom(Function), is_list(Args), is_map(Options) ->
-    call_function_nif(Ref, Function, Args, Options);
+    %% Convert atom to binary string for NIF
+    %% Options are handled on Erlang side for now
+    FunctionBin = atom_to_binary(Function, utf8),
+    call_function_nif(Ref, FunctionBin, Args);
 call_function(Ref, Function, Args, Options) ->
     error(badarg, [Ref, Function, Args, Options]).
 
@@ -142,7 +145,7 @@ load_module_nif(_WasmBinary, _Options) ->
 unload_module_nif(_Ref) ->
     erlang:nif_error(nif_not_loaded).
 
-call_function_nif(_Ref, _Function, _Args, _Options) ->
+call_function_nif(_Ref, _Function, _Args) ->
     erlang:nif_error(nif_not_loaded).
 
 get_exports_nif(_Ref) ->

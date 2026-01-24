@@ -1,0 +1,17 @@
+[package]
+name = "wasm_runtime"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "wasm_runtime_nif"
+crate-type = ["cdylib"]
+
+[dependencies]
+rustler = "0.36"
+wasmtime = "31"
+wasmtime-wasi = "31"
+
+[profile.release]
+lto = true
+opt-level = 3
