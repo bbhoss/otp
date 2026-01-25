@@ -15,7 +15,8 @@ CFLAGS = -Wall -g -O2 -fPIC -D_GNU_SOURCE -D_REENTRANT -fno-math-errno -fno-trap
 LDFLAGS = -g
 
 # Include paths
-INCLUDES = -I$(MQUICKJS_DIR) \
+INCLUDES = -I$(C_SRC_DIR) \
+           -I$(MQUICKJS_DIR) \
            -I$(ERL_INTERFACE_DIR)/include
 
 # For linking, we need the built ei library
@@ -36,7 +37,15 @@ EBIN_DIR = ebin
 PRIV_DIR = priv
 
 # Source files
-CNODE_SRCS = $(C_SRC_DIR)/mquickjs_cnode.c
+# C node sources are split into modules:
+#   - mquickjs_cnode.c : Main entry point and message loop
+#   - js_runtime.c     : JavaScript context and builtin functions
+#   - erlang_protocol.c: Erlang term encoding and command handlers
+CNODE_SRCS = $(C_SRC_DIR)/mquickjs_cnode.c \
+             $(C_SRC_DIR)/js_runtime.c \
+             $(C_SRC_DIR)/erlang_protocol.c
+
+# MQuickJS engine sources
 MQUICKJS_SRCS = $(MQUICKJS_DIR)/mquickjs.c \
                 $(MQUICKJS_DIR)/dtoa.c \
                 $(MQUICKJS_DIR)/libm.c \

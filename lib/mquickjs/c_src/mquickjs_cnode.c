@@ -1,22 +1,25 @@
 /*
- * MQuickJS Erlang C Node
+ * MQuickJS Erlang C Node - Main Entry Point
  *
- * A C node that embeds the MQuickJS JavaScript engine and provides
- * an interface for Erlang to evaluate JavaScript code.
+ * This is the main executable for the MQuickJS C node. It:
+ *   1. Parses command-line arguments
+ *   2. Initializes the Erlang interface (ei)
+ *   3. Connects to the Erlang VM as a hidden node
+ *   4. Initializes the JavaScript runtime
+ *   5. Enters the message processing loop
+ *   6. Cleans up on shutdown
+ *
+ * Usage:
+ *   mquickjs_cnode -n nodename -c cookie -e erlang_node [-m memsize]
+ *
+ * The C node connects to the specified Erlang node and waits for
+ * commands. It runs until it receives a 'stop' command or the
+ * connection is lost.
+ *
+ * See mquickjs_cnode.h for the complete API documentation.
  *
  * Copyright Ericsson AB 2025. All Rights Reserved.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * Licensed under the Apache License, Version 2.0
  */
 
 #include <stdlib.h>
@@ -24,9 +27,6 @@
 #include <string.h>
 #include <signal.h>
 #include <errno.h>
-#include <stdarg.h>
-#include <math.h>
-#include <sys/time.h>
 
 #ifndef _WIN32
 #include <unistd.h>
@@ -35,464 +35,81 @@
 #include <netinet/in.h>
 #endif
 
-#include "ei.h"
-#include "mquickjs.h"
-#include "cutils.h"
+#include "mquickjs_cnode.h"
 
-/* Output capture buffer */
-static char *g_output_buffer = NULL;
-static size_t g_output_buffer_size = 0;
-static size_t g_output_buffer_len = 0;
+/*
+ * ============================================================================
+ * Signal Handling
+ * ============================================================================
+ */
 
-static void clear_output_buffer(void)
-{
-    g_output_buffer_len = 0;
-    if (g_output_buffer) {
-        g_output_buffer[0] = '\0';
-    }
-}
-
-static void append_output(const char *str, size_t len)
-{
-    size_t new_len = g_output_buffer_len + len;
-    if (new_len + 1 > g_output_buffer_size) {
-        size_t new_size = (new_len + 1) * 2;
-        if (new_size < 4096) new_size = 4096;
-        char *new_buf = realloc(g_output_buffer, new_size);
-        if (!new_buf) return;
-        g_output_buffer = new_buf;
-        g_output_buffer_size = new_size;
-    }
-    memcpy(g_output_buffer + g_output_buffer_len, str, len);
-    g_output_buffer_len = new_len;
-    g_output_buffer[g_output_buffer_len] = '\0';
-}
-
-/* JS print function - captures output */
-static JSValue js_print(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
-{
-    int i;
-    JSValue v;
-
-    for (i = 0; i < argc; i++) {
-        if (i != 0) {
-            append_output(" ", 1);
-        }
-        v = argv[i];
-        if (JS_IsString(ctx, v)) {
-            JSCStringBuf buf;
-            const char *str;
-            size_t len;
-            str = JS_ToCStringLen(ctx, &len, v, &buf);
-            append_output(str, len);
-        } else {
-            JSValue str_val = JS_ToString(ctx, v);
-            if (!JS_IsException(str_val)) {
-                JSCStringBuf buf;
-                const char *str;
-                size_t len;
-                str = JS_ToCStringLen(ctx, &len, str_val, &buf);
-                append_output(str, len);
-            }
-        }
-    }
-    append_output("\n", 1);
-    return JS_UNDEFINED;
-}
-
-/* JS Date.now() */
-static JSValue js_date_now(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
-{
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    return JS_NewInt64(ctx, (int64_t)tv.tv_sec * 1000 + (tv.tv_usec / 1000));
-}
-
-/* JS performance.now() */
-static JSValue js_performance_now(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
-{
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    return JS_NewInt64(ctx, (int64_t)tv.tv_sec * 1000 + (tv.tv_usec / 1000));
-}
-
-/* JS gc() - trigger garbage collection */
-static JSValue js_gc(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
-{
-    JS_GC(ctx);
-    return JS_UNDEFINED;
-}
-
-/* JS load() - stub, not supported in C node */
-static JSValue js_load(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
-{
-    return JS_ThrowError(ctx, JS_CLASS_ERROR, "load() is not supported in C node mode");
-}
-
-/* JS setTimeout() - stub, not supported in C node */
-static JSValue js_setTimeout(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
-{
-    return JS_ThrowError(ctx, JS_CLASS_ERROR, "setTimeout() is not supported in C node mode");
-}
-
-/* JS clearTimeout() - stub, not supported in C node */
-static JSValue js_clearTimeout(JSContext *ctx, JSValue *this_val, int argc, JSValue *argv)
-{
-    return JS_ThrowError(ctx, JS_CLASS_ERROR, "clearTimeout() is not supported in C node mode");
-}
-
-/* Include the generated stdlib (use mqjs_stdlib.h from mquickjs - without example classes) */
-#include "mqjs_stdlib.h"
-
-/* Default memory size for JS context (256KB) */
-#define DEFAULT_MEM_SIZE (256 * 1024)
-
-/* Maximum message size */
-#define MAX_MSG_SIZE (64 * 1024)
-
-/* Global state */
-static JSContext *g_js_ctx = NULL;
-static uint8_t *g_mem_buf = NULL;
-static size_t g_mem_size = DEFAULT_MEM_SIZE;
-static volatile int g_running = 1;
-
-/* Log function for mquickjs */
-static void js_log_func(void *opaque, const void *buf, size_t buf_len)
-{
-    (void)opaque;
-    append_output((const char *)buf, buf_len);
-}
-
-/* Initialize the JavaScript context */
-static int init_js_context(size_t mem_size)
-{
-    if (g_js_ctx) {
-        JS_FreeContext(g_js_ctx);
-        free(g_mem_buf);
-    }
-
-    g_mem_size = mem_size > 0 ? mem_size : DEFAULT_MEM_SIZE;
-    g_mem_buf = malloc(g_mem_size);
-    if (!g_mem_buf) {
-        fprintf(stderr, "Failed to allocate memory for JS context\n");
-        return -1;
-    }
-
-    g_js_ctx = JS_NewContext(g_mem_buf, g_mem_size, &js_stdlib);
-    if (!g_js_ctx) {
-        fprintf(stderr, "Failed to create JS context\n");
-        free(g_mem_buf);
-        g_mem_buf = NULL;
-        return -1;
-    }
-
-    JS_SetLogFunc(g_js_ctx, js_log_func);
-    clear_output_buffer();
-    return 0;
-}
-
-/* Cleanup JavaScript context */
-static void cleanup_js_context(void)
-{
-    if (g_js_ctx) {
-        JS_FreeContext(g_js_ctx);
-        g_js_ctx = NULL;
-    }
-    if (g_mem_buf) {
-        free(g_mem_buf);
-        g_mem_buf = NULL;
-    }
-    if (g_output_buffer) {
-        free(g_output_buffer);
-        g_output_buffer = NULL;
-        g_output_buffer_size = 0;
-        g_output_buffer_len = 0;
-    }
-}
-
-/* Convert a JSValue to an Erlang term and encode it */
-static int encode_jsvalue(ei_x_buff *x, JSContext *ctx, JSValue val)
-{
-    if (JS_IsException(val)) {
-        JSValue exc = JS_GetException(ctx);
-        JSCStringBuf buf;
-        const char *str = JS_ToCString(ctx, exc, &buf);
-        ei_x_encode_tuple_header(x, 2);
-        ei_x_encode_atom(x, "error");
-        if (str) {
-            ei_x_encode_string(x, str);
-        } else {
-            ei_x_encode_string(x, "unknown error");
-        }
-        return 0;
-    }
-
-    if (JS_IsUndefined(val)) {
-        ei_x_encode_atom(x, "undefined");
-        return 0;
-    }
-
-    if (JS_IsNull(val)) {
-        ei_x_encode_atom(x, "null");
-        return 0;
-    }
-
-    if (JS_IsBool(val)) {
-        int b = JS_VALUE_GET_SPECIAL_VALUE(val);
-        ei_x_encode_atom(x, b ? "true" : "false");
-        return 0;
-    }
-
-    if (JS_IsInt(val)) {
-        int i = JS_VALUE_GET_INT(val);
-        ei_x_encode_long(x, i);
-        return 0;
-    }
-
-    if (JS_IsNumber(ctx, val)) {
-        double d;
-        if (JS_ToNumber(ctx, &d, val) == 0) {
-            ei_x_encode_double(x, d);
-        } else {
-            ei_x_encode_atom(x, "nan");
-        }
-        return 0;
-    }
-
-    if (JS_IsString(ctx, val)) {
-        JSCStringBuf buf;
-        size_t len;
-        const char *str = JS_ToCStringLen(ctx, &len, val, &buf);
-        if (str) {
-            ei_x_encode_binary(x, str, len);
-        } else {
-            ei_x_encode_binary(x, "", 0);
-        }
-        return 0;
-    }
-
-    /* For objects/arrays, convert to string representation */
-    {
-        JSValue str_val = JS_ToString(ctx, val);
-        if (!JS_IsException(str_val)) {
-            JSCStringBuf buf;
-            size_t len;
-            const char *str = JS_ToCStringLen(ctx, &len, str_val, &buf);
-            if (str) {
-                ei_x_encode_binary(x, str, len);
-            } else {
-                ei_x_encode_binary(x, "[object]", 8);
-            }
-        } else {
-            ei_x_encode_binary(x, "[object]", 8);
-        }
-    }
-    return 0;
-}
-
-/* Handle eval command */
-static int handle_eval(ei_x_buff *resp, const char *buf, int *index)
-{
-    int type, size;
-    char *code = NULL;
-    long code_len;
-    JSValue result;
-
-    if (ei_get_type(buf, index, &type, &size) < 0) {
-        ei_x_encode_tuple_header(resp, 2);
-        ei_x_encode_atom(resp, "error");
-        ei_x_encode_string(resp, "failed to get type");
-        return 0;
-    }
-
-    code = malloc(size + 1);
-    if (!code) {
-        ei_x_encode_tuple_header(resp, 2);
-        ei_x_encode_atom(resp, "error");
-        ei_x_encode_string(resp, "out of memory");
-        return 0;
-    }
-
-    if (type == ERL_BINARY_EXT) {
-        if (ei_decode_binary(buf, index, code, &code_len) < 0) {
-            free(code);
-            ei_x_encode_tuple_header(resp, 2);
-            ei_x_encode_atom(resp, "error");
-            ei_x_encode_string(resp, "failed to decode binary");
-            return 0;
-        }
-        code[code_len] = '\0';
-    } else {
-        if (ei_decode_string(buf, index, code) < 0) {
-            free(code);
-            ei_x_encode_tuple_header(resp, 2);
-            ei_x_encode_atom(resp, "error");
-            ei_x_encode_string(resp, "failed to decode string");
-            return 0;
-        }
-        code_len = strlen(code);
-    }
-
-    /* Clear output buffer before eval */
-    clear_output_buffer();
-
-    /* Evaluate the code */
-    result = JS_Eval(g_js_ctx, code, code_len, "<eval>", JS_EVAL_RETVAL);
-    free(code);
-
-    /* Encode the result */
-    if (JS_IsException(result)) {
-        JSValue exc = JS_GetException(g_js_ctx);
-        JSCStringBuf buf;
-        const char *str = JS_ToCString(g_js_ctx, exc, &buf);
-
-        ei_x_encode_tuple_header(resp, 2);
-        ei_x_encode_atom(resp, "error");
-        if (str) {
-            ei_x_encode_string(resp, str);
-        } else {
-            ei_x_encode_string(resp, "unknown error");
-        }
-    } else {
-        ei_x_encode_tuple_header(resp, 2);
-        ei_x_encode_atom(resp, "ok");
-        encode_jsvalue(resp, g_js_ctx, result);
-    }
-
-    return 0;
-}
-
-/* Handle get_output command */
-static int handle_get_output(ei_x_buff *resp)
-{
-    ei_x_encode_tuple_header(resp, 2);
-    ei_x_encode_atom(resp, "ok");
-    ei_x_encode_binary(resp, g_output_buffer ? g_output_buffer : "", g_output_buffer_len);
-    return 0;
-}
-
-/* Handle gc command */
-static int handle_gc(ei_x_buff *resp)
-{
-    JS_GC(g_js_ctx);
-    ei_x_encode_atom(resp, "ok");
-    return 0;
-}
-
-/* Handle reset command */
-static int handle_reset(ei_x_buff *resp, const char *buf, int *index)
-{
-    long mem_size = DEFAULT_MEM_SIZE;
-    int arity;
-
-    if (ei_decode_tuple_header(buf, index, &arity) == 0 && arity == 1) {
-        ei_decode_long(buf, index, &mem_size);
-    }
-
-    if (init_js_context((size_t)mem_size) < 0) {
-        ei_x_encode_tuple_header(resp, 2);
-        ei_x_encode_atom(resp, "error");
-        ei_x_encode_string(resp, "failed to reset context");
-    } else {
-        ei_x_encode_atom(resp, "ok");
-    }
-
-    return 0;
-}
-
-/* Handle stop command */
-static int handle_stop(ei_x_buff *resp)
-{
-    ei_x_encode_atom(resp, "ok");
-    g_running = 0;
-    return 0;
-}
-
-/* Process a message from Erlang */
-static int process_message(int fd, erlang_pid *from, ei_x_buff *buf)
-{
-    ei_x_buff resp;
-    int index = 0;
-    int version;
-    int arity;
-    char cmd[MAXATOMLEN];
-
-    ei_x_new_with_version(&resp);
-
-    if (ei_decode_version(buf->buff, &index, &version) < 0) {
-        ei_x_encode_tuple_header(&resp, 2);
-        ei_x_encode_atom(&resp, "error");
-        ei_x_encode_string(&resp, "no version");
-        goto send_response;
-    }
-
-    if (ei_decode_tuple_header(buf->buff, &index, &arity) < 0) {
-        ei_x_encode_tuple_header(&resp, 2);
-        ei_x_encode_atom(&resp, "error");
-        ei_x_encode_string(&resp, "expected tuple");
-        goto send_response;
-    }
-
-    if (ei_decode_atom(buf->buff, &index, cmd) < 0) {
-        ei_x_encode_tuple_header(&resp, 2);
-        ei_x_encode_atom(&resp, "error");
-        ei_x_encode_string(&resp, "expected atom command");
-        goto send_response;
-    }
-
-    if (strcmp(cmd, "eval") == 0 && arity == 2) {
-        handle_eval(&resp, buf->buff, &index);
-    } else if (strcmp(cmd, "get_output") == 0 && arity == 1) {
-        handle_get_output(&resp);
-    } else if (strcmp(cmd, "gc") == 0 && arity == 1) {
-        handle_gc(&resp);
-    } else if (strcmp(cmd, "reset") == 0) {
-        handle_reset(&resp, buf->buff, &index);
-    } else if (strcmp(cmd, "stop") == 0 && arity == 1) {
-        handle_stop(&resp);
-    } else {
-        ei_x_encode_tuple_header(&resp, 2);
-        ei_x_encode_atom(&resp, "error");
-        ei_x_encode_tuple_header(&resp, 2);
-        ei_x_encode_atom(&resp, "unknown_command");
-        ei_x_encode_atom(&resp, cmd);
-    }
-
-send_response:
-    ei_send(fd, from, resp.buff, resp.index);
-    ei_x_free(&resp);
-    return 0;
-}
-
+/**
+ * Signal handler for graceful shutdown.
+ *
+ * Catches SIGINT (Ctrl+C) and SIGTERM to allow clean shutdown.
+ * Sets g_running to 0, which causes the main loop to exit.
+ */
 static void signal_handler(int sig)
 {
-    (void)sig;
+    (void)sig;  /* Unused */
     g_running = 0;
 }
 
+/*
+ * ============================================================================
+ * Command-Line Interface
+ * ============================================================================
+ */
+
+/**
+ * Print usage information.
+ *
+ * Displayed when -h is passed or when required arguments are missing.
+ */
 static void usage(const char *progname)
 {
-    fprintf(stderr, "Usage: %s [-n nodename] [-c cookie] [-e erlang_node] [-m memsize]\n", progname);
-    fprintf(stderr, "  -n nodename    : Name of this C node (default: mquickjs)\n");
-    fprintf(stderr, "  -c cookie      : Erlang cookie\n");
-    fprintf(stderr, "  -e erlang_node : Erlang node to connect to\n");
-    fprintf(stderr, "  -m memsize     : JS memory size in KB (default: 256)\n");
-    fprintf(stderr, "  -h             : Show this help\n");
+    fprintf(stderr, "MQuickJS Erlang C Node\n\n");
+    fprintf(stderr, "Usage: %s -n nodename -c cookie -e erlang_node [-m memsize]\n\n",
+            progname);
+    fprintf(stderr, "Required arguments:\n");
+    fprintf(stderr, "  -c cookie      : Erlang cookie for authentication\n");
+    fprintf(stderr, "  -e erlang_node : Erlang node name to connect to\n\n");
+    fprintf(stderr, "Optional arguments:\n");
+    fprintf(stderr, "  -n nodename    : Name for this C node (default: mquickjs)\n");
+    fprintf(stderr, "  -m memsize     : JavaScript memory size in KB (default: 256)\n");
+    fprintf(stderr, "  -h             : Show this help message\n\n");
+    fprintf(stderr, "Example:\n");
+    fprintf(stderr, "  %s -n myjs -c mycookie -e mynode@localhost -m 512\n", progname);
 }
+
+/*
+ * ============================================================================
+ * Main Function
+ * ============================================================================
+ */
 
 int main(int argc, char *argv[])
 {
-    int fd = -1;
+    /* Command-line options */
     int opt;
     const char *nodename = "mquickjs";
     const char *cookie = NULL;
     const char *erlang_node = NULL;
     size_t mem_size = DEFAULT_MEM_SIZE;
+
+    /* Erlang interface state */
     ei_cnode ec;
+    int fd = -1;
     erlang_msg msg;
     ei_x_buff buf;
     int got;
 
+    /*
+     * Parse command-line arguments.
+     *
+     * Required: -c (cookie), -e (erlang node)
+     * Optional: -n (nodename), -m (memory size), -h (help)
+     */
     while ((opt = getopt(argc, argv, "n:c:e:m:h")) != -1) {
         switch (opt) {
         case 'n':
@@ -514,29 +131,49 @@ int main(int argc, char *argv[])
         }
     }
 
+    /* Validate required arguments */
     if (!cookie) {
-        fprintf(stderr, "Error: cookie is required (-c)\n");
+        fprintf(stderr, "Error: Cookie is required (-c)\n\n");
         usage(argv[0]);
         return 1;
     }
 
     if (!erlang_node) {
-        fprintf(stderr, "Error: erlang node is required (-e)\n");
+        fprintf(stderr, "Error: Erlang node is required (-e)\n\n");
         usage(argv[0]);
         return 1;
     }
 
+    /*
+     * Set up signal handlers for graceful shutdown.
+     *
+     * SIGINT  - Ctrl+C from terminal
+     * SIGTERM - Termination request (e.g., from process manager)
+     * SIGPIPE - Ignore broken pipe (connection lost)
+     */
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
 #ifndef _WIN32
     signal(SIGPIPE, SIG_IGN);
 #endif
 
+    /*
+     * Initialize the Erlang interface.
+     *
+     * ei_init() sets up internal state for the ei library.
+     * Must be called before any other ei functions.
+     */
     if (ei_init() < 0) {
-        fprintf(stderr, "Failed to initialize ei\n");
+        fprintf(stderr, "Failed to initialize ei library\n");
         return 1;
     }
 
+    /*
+     * Initialize this C node.
+     *
+     * Creates a node identity with the specified name and cookie.
+     * The cookie must match the Erlang node we're connecting to.
+     */
     if (ei_connect_init(&ec, nodename, cookie, 0) < 0) {
         fprintf(stderr, "Failed to initialize C node: %s\n", strerror(erl_errno));
         return 1;
@@ -544,6 +181,12 @@ int main(int argc, char *argv[])
 
     fprintf(stderr, "C node '%s' initialized\n", ei_thisnodename(&ec));
 
+    /*
+     * Connect to the Erlang node.
+     *
+     * This establishes a TCP connection to the specified Erlang node.
+     * The C node appears as a hidden node (not visible in nodes()).
+     */
     fd = ei_connect(&ec, (char *)erlang_node);
     if (fd < 0) {
         fprintf(stderr, "Failed to connect to Erlang node '%s': %s\n",
@@ -553,38 +196,64 @@ int main(int argc, char *argv[])
 
     fprintf(stderr, "Connected to Erlang node '%s'\n", erlang_node);
 
-    if (init_js_context(mem_size) < 0) {
+    /*
+     * Initialize the JavaScript runtime.
+     *
+     * Creates the MQuickJS context with the specified memory size.
+     * This must succeed before we can process eval commands.
+     */
+    if (js_runtime_init(mem_size) < 0) {
         fprintf(stderr, "Failed to initialize JavaScript context\n");
         ei_close_connection(fd);
         return 1;
     }
 
-    fprintf(stderr, "JavaScript context initialized (mem_size=%zu)\n", g_mem_size);
+    fprintf(stderr, "JavaScript context initialized (mem_size=%zu bytes)\n",
+            js_runtime_get_mem_size());
 
+    /*
+     * Main message processing loop.
+     *
+     * Receives messages from Erlang and dispatches them to handlers.
+     * Continues until:
+     *   - g_running is set to 0 (by 'stop' command or signal)
+     *   - Connection error occurs
+     */
     ei_x_new(&buf);
 
     while (g_running) {
+        /* Receive next message (blocking) */
         got = ei_xreceive_msg(fd, &msg, &buf);
 
         if (got == ERL_TICK) {
+            /* Keepalive tick - just continue */
             continue;
         }
 
         if (got == ERL_ERROR) {
+            /* Check for recoverable errors */
             if (erl_errno == EAGAIN || erl_errno == EINTR) {
                 continue;
             }
+            /* Unrecoverable error - exit loop */
             fprintf(stderr, "Receive error: %s\n", strerror(erl_errno));
             break;
         }
 
+        /* Process regular messages (send/reg_send) */
         if (msg.msgtype == ERL_SEND || msg.msgtype == ERL_REG_SEND) {
             process_message(fd, &msg.from, &buf);
         }
     }
 
+    /*
+     * Cleanup.
+     *
+     * Free all resources in reverse order of allocation.
+     */
     ei_x_free(&buf);
-    cleanup_js_context();
+    js_runtime_cleanup();
+
     if (fd >= 0) {
         ei_close_connection(fd);
     }
