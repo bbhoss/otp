@@ -191,14 +191,11 @@ handle_info({'EXIT', Port, Reason}, #state{port = Port} = State) ->
 
 handle_info({nodedown, Node}, State) ->
     CNodeName = State#state.cnode_name,
-    case atom_to_list(Node) of
-        [$c, $_ | Rest] ->
-            case list_to_atom(Rest) of
-                CNodeName ->
-                    {stop, cnode_down, State};
-                _ ->
-                    {noreply, State}
-            end;
+    %% Check if the downed node matches our C node
+    ExpectedName = list_to_atom(atom_to_list(CNodeName) ++ "@" ++ get_hostname()),
+    case Node of
+        ExpectedName ->
+            {stop, cnode_down, State};
         _ ->
             {noreply, State}
     end;
@@ -278,9 +275,9 @@ start_cnode(CNodeName, MemSize) ->
     end.
 
 %% @private
-%% Wait for the C node to connect
+%% Wait for the C node to connect (C nodes appear as hidden nodes)
 wait_for_cnode(CNodeName, Timeout) ->
-    FullName = list_to_atom("c_" ++ atom_to_list(CNodeName) ++ "@" ++ get_hostname()),
+    FullName = list_to_atom(atom_to_list(CNodeName) ++ "@" ++ get_hostname()),
     wait_for_cnode_loop(FullName, Timeout, erlang:monotonic_time(millisecond)).
 
 wait_for_cnode_loop(FullName, Timeout, StartTime) ->
@@ -291,11 +288,12 @@ wait_for_cnode_loop(FullName, Timeout, StartTime) ->
         Elapsed >= Timeout ->
             {error, timeout};
         true ->
-            case net_adm:ping(FullName) of
-                pong ->
+            %% C nodes appear in the hidden nodes list
+            case lists:member(FullName, nodes(hidden)) of
+                true ->
                     erlang:monitor_node(FullName, true),
                     ok;
-                pang ->
+                false ->
                     timer:sleep(100),
                     wait_for_cnode_loop(FullName, Timeout, StartTime)
             end
@@ -321,7 +319,7 @@ get_hostname() ->
 %% @private
 %% Send a command to the C node and wait for response
 send_command(CNodeName, Command) ->
-    FullName = list_to_atom("c_" ++ atom_to_list(CNodeName) ++ "@" ++ get_hostname()),
+    FullName = list_to_atom(atom_to_list(CNodeName) ++ "@" ++ get_hostname()),
     {any, FullName} ! Command,
     receive
         Reply -> Reply

@@ -48,7 +48,14 @@ ERL_BEAMS = $(patsubst $(SRC_DIR)/%.erl,$(EBIN_DIR)/%.beam,$(ERL_SRCS))
 # Targets
 CNODE_TARGET = $(PRIV_DIR)/mquickjs_cnode
 
-.PHONY: all clean mquickjs_lib erlang cnode
+.PHONY: all clean mquickjs_lib erlang cnode opt debug release docs
+
+# OTP build system compatibility targets
+opt: all
+debug: all
+release: all
+docs:
+	@echo "No documentation to build"
 
 all: dirs mquickjs_lib cnode erlang
 
