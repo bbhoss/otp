@@ -1,0 +1,10 @@
+{application, mquickjs,
+ [{description, "MQuickJS - Erlang interface to the Micro QuickJS JavaScript engine"},
+  {vsn, "1.0.0"},
+  {registered, []},
+  {applications, [kernel, stdlib]},
+  {env, []},
+  {modules, [mquickjs]},
+  {licenses, ["Apache-2.0"]},
+  {links, [{"GitHub", "https://github.com/erlang/otp"}]}
+ ]}.

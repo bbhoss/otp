@@ -1,0 +1,8 @@
+# Build artifacts
+priv/mquickjs_cnode
+ebin/*.beam
+c_src/*.o
+
+# Editor files
+*~
+*.swp
