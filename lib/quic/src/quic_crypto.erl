@@ -45,6 +45,7 @@
     unprotect_header/4,
     protect_packet/4,
     unprotect_packet/4,
+    unprotect_packet/5,
     hkdf_extract/2,
     hkdf_extract/3,
     hkdf_expand_label/4,
@@ -208,6 +209,33 @@ unprotect_packet(ProtectedPacket, _LargestPN, {Key, IV, HPKey}, IsLong) ->
             end
     end.
 
+%% @doc Full packet unprotection for short header with known DCID length.
+-spec unprotect_packet(binary(), non_neg_integer(), key_set(), boolean(), non_neg_integer()) ->
+    {ok, binary(), binary(), non_neg_integer()} | {error, term()}.
+unprotect_packet(ProtectedPacket, _LargestPN, {Key, IV, HPKey}, false = IsLong, DCIDLen) ->
+    PNOffset = find_pn_offset(ProtectedPacket, false, DCIDLen),
+
+    SampleOffset = PNOffset + 4,
+    case byte_size(ProtectedPacket) >= SampleOffset + 16 of
+        false -> {error, packet_too_short};
+        true ->
+            <<_:SampleOffset/binary, Sample:16/binary, _/binary>> = ProtectedPacket,
+            Mask = hp_mask(HPKey, Sample),
+            Unprotected = apply_header_protection(ProtectedPacket, Mask, IsLong, DCIDLen),
+            <<FirstByte:8, _/binary>> = Unprotected,
+            PNLen = (FirstByte band 16#03) + 1,
+            <<_:PNOffset/binary, PNBin:PNLen/binary, CipherPayload/binary>> = Unprotected,
+            PacketNumber = binary:decode_unsigned(PNBin, big),
+            HeaderLen = PNOffset + PNLen,
+            <<Header:HeaderLen/binary, _/binary>> = Unprotected,
+            case decrypt_payload(CipherPayload, Key, IV, PacketNumber, Header) of
+                {ok, PlainPayload} ->
+                    {ok, Header, PlainPayload, PacketNumber};
+                {error, _} = Error ->
+                    Error
+            end
+    end.
+
 %% ===================================================================
 %% HKDF Functions
 %% ===================================================================
@@ -319,6 +347,14 @@ hp_mask(HPKey, Sample) when byte_size(HPKey) =:= 32 ->
 
 %% Apply/remove header protection (same operation, XOR is its own inverse)
 apply_header_protection(Packet, Mask, IsLong) ->
+    PNOffset = find_pn_offset(Packet, IsLong),
+    apply_header_protection_at(Packet, Mask, IsLong, PNOffset).
+
+apply_header_protection(Packet, Mask, IsLong, DCIDLen) ->
+    PNOffset = find_pn_offset(Packet, IsLong, DCIDLen),
+    apply_header_protection_at(Packet, Mask, IsLong, PNOffset).
+
+apply_header_protection_at(Packet, Mask, IsLong, PNOffset) ->
     <<FirstByte:8, Rest/binary>> = Packet,
     <<M0:8, M1:8, M2:8, M3:8, M4:8>> = Mask,
 
@@ -330,14 +366,12 @@ apply_header_protection(Packet, Mask, IsLong) ->
     NewFirstByte = FirstByte bxor (M0 band FirstByteMask),
 
     %% PN length is in the 2 least significant bits of (un)protected first byte
-    %% For protection: use the UNPROTECTED first byte (original)
-    %% For unprotection: use the NEWLY UNPROTECTED first byte
     PNLen = (NewFirstByte band 16#03) + 1,
 
-    %% Find PN offset in Rest
-    PNOffset = find_pn_offset_in_rest(Rest, IsLong, byte_size(Packet)),
+    %% PNOffset is from start of packet, subtract 1 for offset in Rest
+    RestPNOffset = PNOffset - 1,
 
-    <<Before:PNOffset/binary, PNBytes:PNLen/binary, After/binary>> = Rest,
+    <<Before:RestPNOffset/binary, PNBytes:PNLen/binary, After/binary>> = Rest,
     MaskBytes = binary:part(<<M1, M2, M3, M4>>, 0, PNLen),
     NewPNBytes = crypto:exor(PNBytes, MaskBytes),
 
@@ -356,21 +390,27 @@ find_pn_offset(Packet, true) ->
     {TokenFieldLen, R2} = case Type of
         ?INITIAL_PACKET ->
             {TLen, R1} = quic_varint:decode(Rest),
-            {quic_varint:encode_len(TLen) + TLen, R1};
+            %% Actual varint length on wire = bytes consumed
+            TokenVarIntLen = byte_size(Rest) - byte_size(R1),
+            <<_Token:TLen/binary, AfterToken/binary>> = R1,
+            {TokenVarIntLen + TLen, AfterToken};
         _ ->
             {0, Rest}
     end,
     %% Now R2 starts with Length varint
-    {_Length, _R3} = quic_varint:decode(R2),
-    LenFieldLen = quic_varint:encode_len(_Length),
+    {_Length, R3} = quic_varint:decode(R2),
+    %% Use actual on-wire varint length, not minimum encoding
+    LenFieldLen = byte_size(R2) - byte_size(R3),
     BaseOffset + TokenFieldLen + LenFieldLen;
 
 find_pn_offset(_Packet, false) ->
     %% Short header: 1 byte first byte + DCID
-    %% We need to know DCID length from connection context
-    %% For now, parse from the packet structure
-    %% The caller should handle this appropriately
-    1.  %% Placeholder - real implementation uses known DCID length
+    %% Default: assumes empty DCID (only valid when DCID is empty)
+    1.
+
+find_pn_offset(_Packet, false, DCIDLen) ->
+    %% Short header: 1 byte first byte + DCID
+    1 + DCIDLen.
 
 find_pn_offset_in_rest(_Rest, _IsLong, _PacketSize) ->
     %% This is the offset within Rest (after first byte) where PN starts

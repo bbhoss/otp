@@ -263,8 +263,10 @@ encode_long(Type, Version, DCID, SCID, PacketNumber, Payload, Token) ->
             <<>>
     end,
 
-    %% Length field: covers PN + encrypted payload
-    PayloadLen = PNLen + byte_size(Payload),
+    %% Length field: covers PN + encrypted payload (incl. 16 byte AEAD tag)
+    PayloadLen = PNLen + byte_size(Payload) + 16,
+    %% Note: if padding is added after encoding, pad_initial must update
+    %% this length field accordingly.
 
     Header = <<FirstByte:8, Version:32,
                DCIDLen:8, DCID/binary,

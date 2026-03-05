@@ -43,6 +43,7 @@
 -export([
     init_client/2,
     init_server/3,
+    init_server/4,
     handle_crypto_data/3,
     get_client_hello/1
 ]).
@@ -116,6 +117,11 @@ init_client(ALPN, LocalParams) ->
 -spec init_server(string(), string(), [binary()]) ->
     {ok, #tls_state{}} | {error, term()}.
 init_server(CertFile, KeyFile, ALPN) ->
+    init_server(CertFile, KeyFile, ALPN, undefined).
+
+-spec init_server(string(), string(), [binary()], term()) ->
+    {ok, #tls_state{}} | {error, term()}.
+init_server(CertFile, KeyFile, ALPN, LocalParams) ->
     case load_cert_and_key(CertFile, KeyFile) of
         {ok, CertChain, PrivSignKey} ->
             {PubKey, PrivKey} = crypto:generate_key(ecdh, x25519),
@@ -128,6 +134,7 @@ init_server(CertFile, KeyFile, ALPN) ->
                 cert_chain = CertChain,
                 private_sign_key = PrivSignKey,
                 alpn = ALPN,
+                local_params = LocalParams,
                 phase = start
             },
             {ok, State};
@@ -159,16 +166,14 @@ handle_crypto_data(Data, Level, State) ->
 %% ===================================================================
 
 process_handshake_messages(<<>>, _Level, State, Actions) ->
-    {ok, lists:reverse(Actions), State};
+    {ok, Actions, State};
 process_handshake_messages(<<Type:8, Len:24, Msg:Len/binary, Rest/binary>>,
                            Level, State, Actions) ->
     FullMsg = <<Type:8, Len:24, Msg/binary>>,
-    case process_message(Type, Msg, Level, State) of
+    %% Pass FullMsg so handlers can add it to transcript themselves
+    case process_message(Type, Msg, Level, State, FullMsg) of
         {ok, NewActions, NewState} ->
-            State2 = NewState#tls_state{
-                transcript = <<(NewState#tls_state.transcript)/binary, FullMsg/binary>>
-            },
-            process_handshake_messages(Rest, Level, State2, NewActions ++ Actions);
+            process_handshake_messages(Rest, Level, NewState, Actions ++ NewActions);
         {error, _} = Error ->
             Error
     end;
@@ -180,17 +185,16 @@ process_handshake_messages(_Incomplete, _Level, State, Actions) ->
 
 %% Client receives ServerHello
 process_message(?TLS_SERVER_HELLO, Msg, initial,
-                #tls_state{role = client, phase = wait_server_hello} = State) ->
+                #tls_state{role = client, phase = wait_server_hello} = State, FullMsg) ->
     case parse_server_hello(Msg) of
         {ok, CipherSuite, PeerPubKey, ServerRandom} ->
             {HashAlgo, KeyLen} = cipher_suite_info(CipherSuite),
             SharedSecret = crypto:compute_key(ecdh, PeerPubKey,
                                               State#tls_state.private_key, x25519),
 
-            %% Compute transcript hash of CH + SH
-            SHBin = <<2:8, (byte_size(Msg)):24, Msg/binary>>,
-            Transcript = <<(State#tls_state.transcript)/binary, SHBin/binary>>,
-            TranscriptHash = crypto:hash(HashAlgo, Transcript),
+            %% Transcript = CH + SH
+            NewTranscript = <<(State#tls_state.transcript)/binary, FullMsg/binary>>,
+            TranscriptHash = crypto:hash(HashAlgo, NewTranscript),
 
             %% Key schedule: derive handshake secrets
             EarlySecret = quic_crypto:hkdf_extract(
@@ -217,7 +221,7 @@ process_message(?TLS_SERVER_HELLO, Msg, initial,
                 handshake_secret = HandshakeSecret,
                 client_hs_secret = ClientHSSecret,
                 server_hs_secret = ServerHSSecret,
-                transcript = Transcript,
+                transcript = NewTranscript,
                 phase = wait_encrypted_extensions
             },
 
@@ -234,32 +238,36 @@ process_message(?TLS_SERVER_HELLO, Msg, initial,
 
 %% Client receives EncryptedExtensions
 process_message(?TLS_ENCRYPTED_EXTENSIONS, Msg, handshake,
-                #tls_state{role = client, phase = wait_encrypted_extensions} = State) ->
+                #tls_state{role = client, phase = wait_encrypted_extensions} = State, FullMsg) ->
     {ALPN, RemoteParams} = parse_encrypted_extensions(Msg),
+    NewTranscript = <<(State#tls_state.transcript)/binary, FullMsg/binary>>,
     State2 = State#tls_state{
         negotiated_alpn = ALPN,
         remote_params = RemoteParams,
+        transcript = NewTranscript,
         phase = wait_certificate
     },
     {ok, [], State2};
 
 %% Client receives Certificate
 process_message(?TLS_CERTIFICATE, _Msg, handshake,
-                #tls_state{role = client, phase = wait_certificate} = State) ->
+                #tls_state{role = client, phase = wait_certificate} = State, FullMsg) ->
     %% For now, accept any certificate (verify_none)
-    State2 = State#tls_state{phase = wait_certificate_verify},
+    NewTranscript = <<(State#tls_state.transcript)/binary, FullMsg/binary>>,
+    State2 = State#tls_state{transcript = NewTranscript, phase = wait_certificate_verify},
     {ok, [], State2};
 
 %% Client receives CertificateVerify
 process_message(?TLS_CERTIFICATE_VERIFY, _Msg, handshake,
-                #tls_state{role = client, phase = wait_certificate_verify} = State) ->
+                #tls_state{role = client, phase = wait_certificate_verify} = State, FullMsg) ->
     %% For now, accept any signature (verify_none)
-    State2 = State#tls_state{phase = wait_finished},
+    NewTranscript = <<(State#tls_state.transcript)/binary, FullMsg/binary>>,
+    State2 = State#tls_state{transcript = NewTranscript, phase = wait_finished},
     {ok, [], State2};
 
 %% Client receives server Finished
 process_message(?TLS_FINISHED, Msg, handshake,
-                #tls_state{role = client, phase = wait_finished} = State) ->
+                #tls_state{role = client, phase = wait_finished} = State, _FullMsg) ->
     HashAlgo = State#tls_state.hash_algo,
     KeyLen = State#tls_state.key_length,
 
@@ -324,7 +332,7 @@ process_message(?TLS_FINISHED, Msg, handshake,
 
 %% Server receives ClientHello
 process_message(?TLS_CLIENT_HELLO, Msg, initial,
-                #tls_state{role = server, phase = start} = State) ->
+                #tls_state{role = server, phase = start} = State, _FullMsg) ->
     case parse_client_hello(Msg) of
         {ok, CipherSuite, PeerPubKey, ALPN, RemoteParams, ClientRandom, ServerName} ->
             {HashAlgo, KeyLen} = cipher_suite_info(CipherSuite),
@@ -444,7 +452,7 @@ process_message(?TLS_CLIENT_HELLO, Msg, initial,
 
 %% Server receives client Finished
 process_message(?TLS_FINISHED, Msg, handshake,
-                #tls_state{role = server, phase = wait_client_finished} = State) ->
+                #tls_state{role = server, phase = wait_client_finished} = State, _FullMsg) ->
     HashAlgo = State#tls_state.hash_algo,
 
     %% Verify client's Finished
@@ -467,7 +475,7 @@ process_message(?TLS_FINISHED, Msg, handshake,
             {ok, Actions, State2}
     end;
 
-process_message(Type, _Msg, _Level, _State) ->
+process_message(Type, _Msg, _Level, _State, _FullMsg) ->
     {error, {unexpected_message, Type}}.
 
 %% ===================================================================
@@ -614,13 +622,17 @@ parse_extension(?TLS_EXT_SUPPORTED_VERSIONS, <<_Len:8, List/binary>>, Acc) ->
     Versions = [V || <<V:16>> <= List],
     Acc#{supported_versions => Versions};
 parse_extension(?TLS_EXT_KEY_SHARE, Bin, Acc) ->
-    %% Server key share: group(2) + key_len(2) + key
+    %% Distinguish server vs client key share by context:
+    %% Client: entries_len(2) + [group(2) + key_len(2) + key]*
+    %% Server: group(2) + key_len(2) + key (no entries_len prefix)
+    %% Heuristic: if first 2 bytes as length equals remaining, it's client format
     case Bin of
-        <<_Group:16, KLen:16, Key:KLen/binary, _/binary>> ->
-            Acc#{key_share => Key};
-        %% Client key share: entries_len(2) + entries...
-        <<_EntriesLen:16, Entries/binary>> ->
+        <<EntriesLen:16, Entries:EntriesLen/binary>> when EntriesLen =:= byte_size(Bin) - 2 ->
+            %% Client key share
             parse_key_share_entries(Entries, Acc);
+        <<Group:16, KLen:16, Key:KLen/binary, _/binary>> ->
+            %% Server key share (no length prefix)
+            Acc#{key_share => Key};
         _ ->
             Acc
     end;
@@ -684,12 +696,14 @@ cipher_suite_info(_) -> {sha256, 16}.
 hash_length(sha256) -> 32;
 hash_length(sha384) -> 48.
 
-derive_secret(Secret, Label, ContextHash, HashAlgo) when is_binary(ContextHash) ->
-    quic_crypto:hkdf_expand_label(Secret, Label, ContextHash,
-                                   hash_length(HashAlgo), HashAlgo, <<"tls13 ">>);
 derive_secret(Secret, Label, <<>>, HashAlgo) ->
+    %% No messages: use Hash("") as context per RFC 8446 Derive-Secret
     EmptyHash = crypto:hash(HashAlgo, <<>>),
     quic_crypto:hkdf_expand_label(Secret, Label, EmptyHash,
+                                   hash_length(HashAlgo), HashAlgo, <<"tls13 ">>);
+derive_secret(Secret, Label, ContextHash, HashAlgo) when is_binary(ContextHash) ->
+    %% Pre-computed transcript hash
+    quic_crypto:hkdf_expand_label(Secret, Label, ContextHash,
                                    hash_length(HashAlgo), HashAlgo, <<"tls13 ">>).
 
 negotiate_alpn(ClientALPN, ServerALPN) ->

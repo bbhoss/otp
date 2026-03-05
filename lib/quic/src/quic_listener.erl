@@ -117,20 +117,9 @@ listening({call, From}, accept, Data) ->
             {keep_state, Data#listener_data{acceptors = Acceptors}}
     end;
 
-listening(info, {select, Socket, _Ref, ready_input},
+listening(info, {'$socket', Socket, select, _Ref},
           #listener_data{socket = Socket} = Data) ->
-    case socket:recvfrom(Socket, 0, [], nowait) of
-        {ok, {Source, PacketData}} ->
-            %% Re-arm receive
-            socket:recvfrom(Socket, 0, [], nowait),
-            Data2 = handle_incoming_packet(PacketData, Source, Data),
-            {keep_state, Data2};
-        {select, _} ->
-            {keep_state, Data};
-        {error, _Reason} ->
-            socket:recvfrom(Socket, 0, [], nowait),
-            {keep_state, Data}
-    end;
+    drain_socket(Socket, Data);
 
 listening(info, {'DOWN', MonRef, process, _Pid, _Reason}, Data) ->
     %% Connection process died - remove from routing table
@@ -145,8 +134,27 @@ listening(info, {'DOWN', MonRef, process, _Pid, _Reason}, Data) ->
             {keep_state, Data}
     end;
 
-listening(info, _Msg, _Data) ->
+listening(info, {register_scid, SCID, ConnPid}, Data) ->
+    %% Connection process registering its SCID for routing
+    NewConns = maps:put(SCID, ConnPid, Data#listener_data.connections),
+    {keep_state, Data#listener_data{connections = NewConns}};
+
+listening(info, Msg, _Data) ->
+    io:format("[listener] unexpected info: ~p~n", [Msg]),
     keep_state_and_data.
+
+drain_socket(Socket, Data) ->
+    case socket:recvfrom(Socket, 0, [], nowait) of
+        {ok, {Source, PacketData}} ->
+            io:format("[listener] recv ~p bytes from ~p~n", [byte_size(PacketData), Source]),
+            Data2 = handle_incoming_packet(PacketData, Source, Data),
+            drain_socket(Socket, Data2);
+        {select, _} ->
+            {keep_state, Data};
+        {error, Reason} ->
+            io:format("[listener] recv error: ~p~n", [Reason]),
+            {keep_state, Data}
+    end.
 
 terminate(_Reason, _State, #listener_data{socket = Socket}) ->
     socket:close(Socket),
@@ -157,11 +165,13 @@ terminate(_Reason, _State, #listener_data{socket = Socket}) ->
 %% ===================================================================
 
 handle_incoming_packet(PacketData, Source, Data) ->
+    io:format("[listener] handle_incoming_packet, first_byte=~p~n", [binary:first(PacketData)]),
     case PacketData of
         <<1:1, _:7, _/binary>> ->
             %% Long header - extract DCID
             case extract_dcid(PacketData) of
                 {ok, DCID} ->
+                    io:format("[listener] long header, DCID=~p~n", [DCID]),
                     case maps:find(DCID, Data#listener_data.connections) of
                         {ok, ConnPid} ->
                             %% Route to existing connection
@@ -217,21 +227,29 @@ create_new_connection(PacketData, Source, DCID, Data) ->
             %% The connection will tell us its SCID later
 
             %% Initialize the connection with the Initial packet
-            quic_connection:accept_init(ConnPid, Data#listener_data.socket,
-                                         Source, PacketData),
+            case quic_connection:accept_init(ConnPid, Data#listener_data.socket,
+                                              Source, PacketData) of
+                {ok, SCID} ->
+                    %% Register SCID for routing future packets
+                    NewConns2 = maps:put(SCID, ConnPid, NewConns),
+                    ok;
+                {error, _} ->
+                    NewConns2 = NewConns,
+                    ok
+            end,
 
             %% Deliver to acceptor or queue
             case Data#listener_data.acceptors of
                 [{From, _} | RestAcceptors] ->
                     gen_statem:reply(From, {ok, ConnPid}),
                     Data#listener_data{
-                        connections = NewConns,
+                        connections = NewConns2,
                         conn_monitors = NewMonitors,
                         acceptors = RestAcceptors
                     };
                 [] ->
                     Data#listener_data{
-                        connections = NewConns,
+                        connections = NewConns2,
                         conn_monitors = NewMonitors,
                         pending = Data#listener_data.pending ++ [ConnPid]
                     }

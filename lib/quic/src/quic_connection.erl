@@ -115,7 +115,9 @@
     idle_timer          :: reference() | undefined,
     idle_timeout = 30000 :: non_neg_integer(),
     %% PTO timer
-    pto_timer           :: reference() | undefined
+    pto_timer           :: reference() | undefined,
+    %% Handshake complete flag (set when TLS handshake_complete action received)
+    handshake_done = false :: boolean()
 }).
 
 %% ===================================================================
@@ -129,7 +131,7 @@ connect(Pid, Host, Port, Timeout) ->
     gen_statem:call(Pid, {connect, Host, Port}, Timeout).
 
 accept_init(Pid, Socket, PeerAddr, InitialPacket) ->
-    gen_statem:cast(Pid, {accept_init, Socket, PeerAddr, InitialPacket}).
+    gen_statem:call(Pid, {accept_init, Socket, PeerAddr, InitialPacket}, 5000).
 
 open_stream(Pid, Opts) ->
     gen_statem:call(Pid, {open_stream, Opts}).
@@ -249,7 +251,10 @@ idle({call, From}, {connect, Host, Port}, Data) ->
             ProtectedPacket = protect_initial_packet(PaddedPacket, 0, ClientKeys),
 
             %% Send
-            socket:sendto(Socket, ProtectedPacket, PeerAddr),
+            io:format("[conn:~p] client sending Initial, ~p bytes to ~p~n",
+                      [self(), byte_size(ProtectedPacket), PeerAddr]),
+            SendResult = socket:sendto(Socket, ProtectedPacket, PeerAddr),
+            io:format("[conn:~p] sendto result: ~p~n", [self(), SendResult]),
 
             %% Start receiving
             start_recv(Socket),
@@ -280,16 +285,19 @@ idle({call, From}, {connect, Host, Port}, Data) ->
             {keep_state_and_data, [{reply, From, {error, Reason}}]}
     end;
 
-idle(cast, {accept_init, Socket, PeerAddr, PacketData}, Data) ->
-    %% Server receiving initial packet
-    case process_initial_packet(PacketData, Data) of
+idle({call, From}, {accept_init, Socket, PeerAddr, PacketData}, Data) ->
+    %% Server receiving initial packet — set socket/peer first so TLS can send
+    io:format("[conn:~p] accept_init, pkt=~p bytes~n", [self(), byte_size(PacketData)]),
+    Data1 = Data#conn_data{udp_socket = Socket, peer_addr = PeerAddr},
+    case process_initial_packet(PacketData, Data1) of
         {ok, Data2} ->
-            Data3 = Data2#conn_data{
-                udp_socket = Socket,
-                peer_addr = PeerAddr
-            },
-            {next_state, handshake, Data3};
-        {error, _Reason} ->
+            io:format("[conn:~p] initial processed OK, app_keys=~p~n",
+                      [self(), Data2#conn_data.app_keys =/= undefined]),
+            SCID = Data2#conn_data.scid,
+            {next_state, handshake, Data2, [{reply, From, {ok, SCID}}]};
+        {error, Reason} ->
+            io:format("[conn:~p] initial FAILED: ~p~n", [self(), Reason]),
+            gen_statem:reply(From, {error, Reason}),
             {stop, normal}
     end;
 
@@ -300,35 +308,28 @@ idle(info, Msg, Data) ->
 %% State: handshake
 %% ===================================================================
 
-handshake(cast, {packet, PacketData, PeerAddr}, Data) ->
+handshake(cast, {packet, PacketData, _PeerAddr}, Data) ->
+    io:format("[conn:~p] handshake got packet, ~p bytes~n", [self(), byte_size(PacketData)]),
     case process_received_packet(PacketData, Data) of
         {ok, Data2} ->
-            case Data2#conn_data.tls_state of
-                undefined ->
-                    {keep_state, Data2};
-                _ ->
-                    {keep_state, Data2}
-            end;
-        {error, _Reason} ->
+            io:format("[conn:~p] handshake packet OK, hs_done=~p~n",
+                      [self(), Data2#conn_data.handshake_done]),
+            %% If handshake just completed, send ACK for client's Handshake
+            Data3 = case Data2#conn_data.handshake_done of
+                true -> send_handshake_ack(Data2);
+                false -> Data2
+            end,
+            maybe_transition_to_established(Data3);
+        {error, Reason} ->
+            io:format("[conn:~p] handshake packet FAILED: ~p~n", [self(), Reason]),
             {keep_state, Data}
     end;
 
-handshake(info, {select, Socket, _SelectRef, ready_input}, #conn_data{udp_socket = Socket} = Data) ->
-    case socket:recvfrom(Socket, 0, [], nowait) of
-        {ok, {Source, PacketData}} ->
-            start_recv(Socket),
-            case process_received_packet(PacketData, Data) of
-                {ok, Data2} ->
-                    maybe_transition_to_established(Data2);
-                {error, _} ->
-                    start_recv(Socket),
-                    {keep_state, Data}
-            end;
-        {select, _} ->
-            {keep_state, Data};
-        {error, _} ->
-            {keep_state, Data}
-    end;
+handshake(info, {'$socket', Socket, select, _SelectRef}, #conn_data{udp_socket = Socket} = Data) ->
+    handshake_drain(Socket, Data);
+
+handshake(info, {handshake_drain, Socket}, #conn_data{udp_socket = Socket} = Data) ->
+    handshake_drain(Socket, Data);
 
 handshake(info, pto_timeout, Data) ->
     %% PTO fired during handshake - retransmit
@@ -349,6 +350,12 @@ handshake({call, From}, accept_stream, Data) ->
         stream_acceptors = Data#conn_data.stream_acceptors ++ [{From, undefined}]
     },
     {keep_state, Data2};
+
+handshake({call, From}, {controlling_process, NewOwner}, Data) ->
+    erlang:demonitor(Data#conn_data.owner_mon, [flush]),
+    MonRef = erlang:monitor(process, NewOwner),
+    {keep_state, Data#conn_data{owner = NewOwner, owner_mon = MonRef},
+     [{reply, From, ok}]};
 
 handshake(info, Msg, Data) ->
     handle_common_info(Msg, handshake, Data).
@@ -494,7 +501,7 @@ established(cast, {packet, PacketData, _PeerAddr}, Data) ->
         {error, _} -> {keep_state, Data}
     end;
 
-established(info, {select, Socket, _Ref, ready_input},
+established(info, {'$socket', Socket, select, _Ref},
             #conn_data{udp_socket = Socket} = Data) ->
     case socket:recvfrom(Socket, 0, [], nowait) of
         {ok, {_Source, PacketData}} ->
@@ -549,7 +556,7 @@ established(info, Msg, Data) ->
 %% State: closing
 %% ===================================================================
 
-closing(info, {select, Socket, _Ref, ready_input},
+closing(info, {'$socket', Socket, select, _Ref},
         #conn_data{udp_socket = Socket} = Data) ->
     %% Drain remaining packets
     socket:recvfrom(Socket, 0, [], nowait),
@@ -597,6 +604,8 @@ process_initial_packet(PacketData, Data) ->
     %% Parse the unprotected parts of the Initial packet to get DCID
     case quic_packet:decode_header(PacketData) of
         {ok, #quic_packet{type = initial, dcid = DCID, scid = PeerSCID} = _Pkt, _Rest} ->
+            io:format("[conn:~p] Initial: DCID=~p (~p bytes), PeerSCID=~p (~p bytes)~n",
+                      [self(), DCID, byte_size(DCID), PeerSCID, byte_size(PeerSCID)]),
             %% Derive initial keys from client's DCID
             InitialKeys = quic_crypto:derive_initial_keys(DCID),
 
@@ -627,25 +636,31 @@ process_initial_packet(PacketData, Data) ->
     end.
 
 process_server_initial(OrigDCID, PeerSCID, CryptoData, InitialKeys, Data) ->
-    %% Initialize TLS server
-    {ok, TLSState0} = quic_tls:init_server(
-        Data#conn_data.certfile, Data#conn_data.keyfile, Data#conn_data.alpn),
-
     %% Set local transport params with original DCID
     LocalParams = (Data#conn_data.local_params)#transport_params{
         original_destination_connection_id = OrigDCID,
         initial_source_connection_id = Data#conn_data.scid
     },
-    %% TODO: inject local_params into TLS state properly
+
+    %% Initialize TLS server with local params
+    {ok, TLSState0} = quic_tls:init_server(
+        Data#conn_data.certfile, Data#conn_data.keyfile, Data#conn_data.alpn,
+        LocalParams),
 
     case quic_tls:handle_crypto_data(CryptoData, initial, TLSState0) of
         {ok, Actions, TLSState} ->
+            %% Update crypto_offset for initial pn_space to prevent reprocessing
+            PNSpaces0 = Data#conn_data.pn_spaces,
+            InitialPN = maps:get(initial, PNSpaces0),
+            InitialPN2 = InitialPN#pn_space{crypto_offset = byte_size(CryptoData)},
+            PNSpaces1 = PNSpaces0#{initial => InitialPN2},
             Data2 = Data#conn_data{
                 dcid = PeerSCID,
                 original_dcid = OrigDCID,
                 initial_keys = InitialKeys,
                 tls_state = TLSState,
-                local_params = LocalParams
+                local_params = LocalParams,
+                pn_spaces = PNSpaces1
             },
             Data3 = process_tls_actions(Actions, Data2),
             {ok, Data3};
@@ -703,14 +718,21 @@ process_long_header_packet(PacketData, Data) ->
                         server ->
                             maps:get(client, HSKeys)
                     end,
+                    {CK, CIV, CHP} = Keys,
+                    io:format("[conn:~p] HS decrypt: key=~p~n  iv=~p~n  hp=~p~n  pkt_size=~p~n  raw=~p~n",
+                              [self(), CK, CIV, CHP, byte_size(PacketData), PacketData]),
                     case quic_crypto:unprotect_packet(PacketData, 0, Keys, true) of
                         {ok, _Header, Payload, _PN} ->
+                            io:format("[conn:~p] HS decrypt OK, PN=~p, payload=~p bytes~n",
+                                      [self(), _PN, byte_size(Payload)]),
                             case quic_frame:decode_all(Payload) of
                                 {ok, Frames} ->
                                     process_frames(Frames, handshake, Data);
                                 {error, _} = Err -> Err
                             end;
-                        {error, _} = Err -> Err
+                        {error, _} = Err ->
+                            io:format("[conn:~p] HS decrypt FAILED: ~p~n", [self(), Err]),
+                            Err
                     end
             end;
         _ ->
@@ -720,21 +742,40 @@ process_long_header_packet(PacketData, Data) ->
 process_short_header_packet(PacketData, Data) ->
     case Data#conn_data.app_keys of
         undefined ->
+            io:format("[conn:~p] 1-RTT packet but no app_keys~n", [self()]),
             {error, no_app_keys};
         AppKeys ->
             Keys = case Data#conn_data.role of
                 client -> maps:get(server, AppKeys);
                 server -> maps:get(client, AppKeys)
             end,
+            {CK, CIV, CHP} = Keys,
             DCIDLen = byte_size(Data#conn_data.scid),
-            case quic_crypto:unprotect_packet(PacketData, 0, Keys, false) of
-                {ok, _Header, Payload, _PN} ->
+            io:format("[conn:~p] 1-RTT decrypt: DCIDLen=~p, pkt_size=~p~n  key=~w~n  iv=~w~n  hp=~w~n  raw_hex=~s~n",
+                      [self(), DCIDLen, byte_size(PacketData), CK, CIV, CHP,
+                       binary:encode_hex(PacketData)]),
+            case quic_crypto:unprotect_packet(PacketData, 0, Keys, false, DCIDLen) of
+                {ok, _Header, Payload, PN} ->
+                    io:format("[conn:~p] 1-RTT decrypt OK, PN=~p, payload=~p bytes~n",
+                              [self(), PN, byte_size(Payload)]),
                     case quic_frame:decode_all(Payload) of
                         {ok, Frames} ->
-                            process_frames(Frames, application, Data);
-                        {error, _} = Err -> Err
+                            io:format("[conn:~p] 1-RTT frames: ~p~n", [self(), Frames]),
+                            case process_frames(Frames, application, Data) of
+                                {ok, Data2} ->
+                                    %% Send ACK for received 1-RTT packet
+                                    Data3 = send_app_ack(PN, Data2),
+                                    {ok, Data3};
+                                {error, _} = Err2 ->
+                                    Err2
+                            end;
+                        {error, _} = Err ->
+                            io:format("[conn:~p] 1-RTT frame decode error: ~p~n", [self(), Err]),
+                            Err
                     end;
-                {error, _} = Err -> Err
+                {error, _} = Err ->
+                    io:format("[conn:~p] 1-RTT decrypt FAILED: ~p~n", [self(), Err]),
+                    Err
             end
     end.
 
@@ -766,26 +807,41 @@ process_frame({crypto, Offset, CryptoData}, Level, Data) ->
     PNSpace = level_to_pn_space(Level),
     PNSpaces = Data#conn_data.pn_spaces,
     PN = maps:get(PNSpace, PNSpaces),
-    ExistingBuf = PN#pn_space.crypto_buffer,
-    %% Simple: assume in-order delivery for now
-    NewBuf = <<ExistingBuf/binary, CryptoData/binary>>,
-    NewPN = PN#pn_space{crypto_buffer = NewBuf, crypto_offset = Offset + byte_size(CryptoData)},
-    NewPNSpaces = PNSpaces#{PNSpace => NewPN},
-    Data2 = Data#conn_data{pn_spaces = NewPNSpaces},
+    EndOffset = Offset + byte_size(CryptoData),
+    %% Skip already-processed crypto data (handles retransmissions)
+    case EndOffset =< PN#pn_space.crypto_offset of
+        true ->
+            {ok, Data};
+        false ->
+            ExistingBuf = PN#pn_space.crypto_buffer,
+            %% Trim any overlap with already-processed data
+            NewData = case Offset < PN#pn_space.crypto_offset of
+                true ->
+                    Skip = PN#pn_space.crypto_offset - Offset,
+                    <<_:Skip/binary, Rest/binary>> = CryptoData,
+                    Rest;
+                false ->
+                    CryptoData
+            end,
+            NewBuf = <<ExistingBuf/binary, NewData/binary>>,
+            NewPN = PN#pn_space{crypto_buffer = NewBuf, crypto_offset = EndOffset},
+            NewPNSpaces = PNSpaces#{PNSpace => NewPN},
+            Data2 = Data#conn_data{pn_spaces = NewPNSpaces},
 
-    %% Process accumulated crypto data through TLS
-    case quic_tls:handle_crypto_data(NewBuf, Level, Data2#conn_data.tls_state) of
-        {ok, Actions, TLSState} ->
-            %% Clear the buffer
-            ClearedPN = NewPN#pn_space{crypto_buffer = <<>>},
-            Data3 = Data2#conn_data{
-                tls_state = TLSState,
-                pn_spaces = (Data2#conn_data.pn_spaces)#{PNSpace => ClearedPN}
-            },
-            Data4 = process_tls_actions(Actions, Data3),
-            {ok, Data4};
-        {error, _} = Err ->
-            Err
+            %% Process accumulated crypto data through TLS
+            case quic_tls:handle_crypto_data(NewBuf, Level, Data2#conn_data.tls_state) of
+                {ok, Actions, TLSState} ->
+                    %% Clear the buffer
+                    ClearedPN = NewPN#pn_space{crypto_buffer = <<>>},
+                    Data3 = Data2#conn_data{
+                        tls_state = TLSState,
+                        pn_spaces = (Data2#conn_data.pn_spaces)#{PNSpace => ClearedPN}
+                    },
+                    Data4 = process_tls_actions(Actions, Data3),
+                    {ok, Data4};
+                {error, _} = Err ->
+                    Err
+            end
     end;
 
 process_frame({stream, StreamId, Offset, StreamData, Fin}, _Level, Data) ->
@@ -870,23 +926,25 @@ process_tls_action({send_crypto, Level, CryptoData}, Data) ->
     send_crypto_data(CryptoData, Level, Data);
 
 process_tls_action({handshake_keys, Keys}, Data) ->
+    #{client := {CK, CIV, CHP}, server := {SK, SIV, SHP}} = Keys,
+    io:format("[conn:~p] HS KEYS installed:~n  client_key=~p~n  client_iv=~p~n  client_hp=~p~n  server_key=~p~n  server_iv=~p~n  server_hp=~p~n",
+              [self(), CK, CIV, CHP, SK, SIV, SHP]),
     Data#conn_data{handshake_keys = Keys};
 
 process_tls_action({application_keys, Keys}, Data) ->
+    #{client := {ACK, ACIV, ACHP}, server := {ASK, ASIV, ASHP}} = Keys,
+    io:format("[conn:~p] APP KEYS installed:~n  client_key=~p~n  client_iv=~p~n  client_hp=~p~n  server_key=~p~n  server_iv=~p~n  server_hp=~p~n",
+              [self(), ACK, ACIV, ACHP, ASK, ASIV, ASHP]),
     Data#conn_data{app_keys = Keys};
 
-process_tls_action({handshake_complete, ALPN, RemoteParams}, Data) ->
-    %% Notify waiting callers
-    lists:foreach(fun({From, _}) ->
-        gen_statem:reply(From, {ok, self()})
-    end, Data#conn_data.conn_waiters),
+process_tls_action({handshake_complete, _ALPN, RemoteParams}, Data) ->
     Data#conn_data{
+        handshake_done = true,
         remote_params = RemoteParams,
         max_data_remote = case RemoteParams of
             #transport_params{initial_max_data = V} -> V;
             _ -> 0
-        end,
-        conn_waiters = []
+        end
     };
 
 process_tls_action(send_handshake_done, Data) ->
@@ -902,8 +960,10 @@ process_tls_action(_, Data) ->
 %% ===================================================================
 
 send_crypto_data(CryptoData, initial, Data) ->
-    %% Send in an Initial packet
+    %% Send in an Initial packet with ACK for client's Initial
+    AckFrame = quic_frame:encode({ack, 0, 0, [0]}),
     CryptoFrame = quic_frame:encode({crypto, 0, CryptoData}),
+    Payload = <<AckFrame/binary, CryptoFrame/binary>>,
     #{server := ServerKeys} = Data#conn_data.initial_keys,
     Keys = case Data#conn_data.role of
         server -> ServerKeys;
@@ -917,7 +977,7 @@ send_crypto_data(CryptoData, initial, Data) ->
 
     Packet = quic_packet:encode_initial(
         Data#conn_data.dcid, Data#conn_data.scid,
-        <<>>, PN, CryptoFrame),
+        <<>>, PN, Payload),
 
     ProtectedPacket = protect_initial_packet(Packet, PN, Keys),
     send_udp(ProtectedPacket, Data),
@@ -927,6 +987,8 @@ send_crypto_data(CryptoData, initial, Data) ->
 
 send_crypto_data(CryptoData, handshake, Data) ->
     CryptoFrame = quic_frame:encode({crypto, 0, CryptoData}),
+    io:format("[conn:~p] HS send: crypto_data=~p, crypto_frame=~p~n",
+              [self(), byte_size(CryptoData), byte_size(CryptoFrame)]),
     HSKeys = Data#conn_data.handshake_keys,
     Keys = case Data#conn_data.role of
         server -> maps:get(server, HSKeys);
@@ -938,8 +1000,10 @@ send_crypto_data(CryptoData, handshake, Data) ->
 
     Packet = quic_packet:encode_handshake(
         Data#conn_data.dcid, Data#conn_data.scid, PN, CryptoFrame),
+    io:format("[conn:~p] HS plain packet=~p bytes~n", [self(), byte_size(Packet)]),
 
     ProtectedPacket = protect_long_packet(Packet, PN, Keys),
+    io:format("[conn:~p] HS protected packet=~p bytes~n", [self(), byte_size(ProtectedPacket)]),
     send_udp(ProtectedPacket, Data),
 
     NewPNSpaces = PNSpaces#{handshake => HSPN#pn_space{next_pn = PN + 1}},
@@ -947,6 +1011,31 @@ send_crypto_data(CryptoData, handshake, Data) ->
 
 send_crypto_data(_CryptoData, _Level, Data) ->
     Data.
+
+%% Send ACK for client's Handshake packet
+send_handshake_ack(Data) ->
+    case Data#conn_data.handshake_keys of
+        undefined -> Data;
+        HSKeys ->
+            AckFrame = quic_frame:encode({ack, 0, 0, [0]}),
+            Keys = case Data#conn_data.role of
+                server -> maps:get(server, HSKeys);
+                client -> maps:get(client, HSKeys)
+            end,
+            PNSpaces = Data#conn_data.pn_spaces,
+            HSPN = maps:get(handshake, PNSpaces),
+            PN = HSPN#pn_space.next_pn,
+            Packet = quic_packet:encode_handshake(
+                Data#conn_data.dcid, Data#conn_data.scid, PN, AckFrame),
+            ProtectedPacket = protect_long_packet(Packet, PN, Keys),
+            send_udp(ProtectedPacket, Data),
+            NewPNSpaces = PNSpaces#{handshake => HSPN#pn_space{next_pn = PN + 1}},
+            Data#conn_data{pn_spaces = NewPNSpaces}
+    end.
+
+send_app_ack(RecvPN, Data) ->
+    AckFrame = quic_frame:encode({ack, RecvPN, 0, [RecvPN]}),
+    send_app_data(AckFrame, Data).
 
 send_stream_frames(Frames, Data) ->
     FramesBin = iolist_to_binary([quic_frame:encode(F) || F <- Frames]),
@@ -965,8 +1054,13 @@ send_app_data(FrameData, Data) ->
             AppPN = maps:get(application, PNSpaces),
             PN = AppPN#pn_space.next_pn,
 
+            %% Pad payload to at least 4 bytes (RFC 9001 §5.4.2: sample requires it)
+            PaddedFrameData = case byte_size(FrameData) < 4 of
+                true -> <<FrameData/binary, 0:(8 * (4 - byte_size(FrameData)))>>;
+                false -> FrameData
+            end,
             Packet = quic_packet:encode_short(
-                Data#conn_data.dcid, PN, FrameData),
+                Data#conn_data.dcid, PN, PaddedFrameData),
             ProtectedPacket = protect_short_packet(Packet, PN, Keys,
                                                     byte_size(Data#conn_data.dcid)),
             send_udp(ProtectedPacket, Data),
@@ -976,7 +1070,11 @@ send_app_data(FrameData, Data) ->
     end.
 
 send_udp(Packet, #conn_data{udp_socket = Socket, peer_addr = PeerAddr}) ->
-    socket:sendto(Socket, Packet, PeerAddr).
+    io:format("[conn:~p] send_udp ~p bytes, first 20: ~w~n",
+              [self(), byte_size(Packet), binary:part(Packet, 0, min(20, byte_size(Packet)))]),
+    Result = socket:sendto(Socket, Packet, PeerAddr),
+    io:format("[conn:~p] send_udp result: ~p~n", [self(), Result]),
+    Result.
 
 %% ===================================================================
 %% Packet Protection Helpers
@@ -1006,14 +1104,14 @@ protect_long_packet(Packet, PN, {Key, IV, HPKey}) ->
 
     %% Apply header protection
     Mask = hp_mask(HPKey, Sample),
-    <<M0:8, M1:8, M2:8, M3:8, _M4:8>> = Mask,
+    <<M0:8, M1:8, M2:8, M3:8, M4:8>> = Mask,
 
     NewFB = FB bxor (M0 band 16#0f),
     <<_:PNOffset/binary, PNBytes:PNLen/binary, _/binary>> = Packet,
-    MaskPN = binary:part(<<M1, M2, M3, M3>>, 0, PNLen),
+    MaskPN = binary:part(<<M1, M2, M3, M4>>, 0, PNLen),
     NewPN = crypto:exor(PNBytes, MaskPN),
 
-    <<Pre:1/binary, Mid:(PNOffset-1)/binary, _:PNLen/binary, _/binary>> = Packet,
+    <<_Pre:1/binary, Mid:(PNOffset-1)/binary, _:PNLen/binary, _/binary>> = Packet,
     <<NewFB:8, Mid/binary, NewPN/binary, CipherPayload/binary>>.
 
 protect_short_packet(Packet, PN, {Key, IV, HPKey}, DCIDLen) ->
@@ -1035,10 +1133,10 @@ protect_short_packet(Packet, PN, {Key, IV, HPKey}, DCIDLen) ->
         true ->
             <<_:SampleStart/binary, Sample:16/binary, _/binary>> = CipherPayload,
             Mask = hp_mask(HPKey, Sample),
-            <<M0:8, M1:8, M2:8, M3:8, _:8>> = Mask,
+            <<M0:8, M1:8, M2:8, M3:8, M4:8>> = Mask,
             NewFB = FB bxor (M0 band 16#1f),
             <<_:PNOffset/binary, PNBytes:PNLen/binary, _/binary>> = Packet,
-            MaskPN = binary:part(<<M1, M2, M3, M3>>, 0, PNLen),
+            MaskPN = binary:part(<<M1, M2, M3, M4>>, 0, PNLen),
             NewPN = crypto:exor(PNBytes, MaskPN),
             <<_Pre:1/binary, DCID:DCIDLen/binary, _:PNLen/binary, _/binary>> = Packet,
             <<NewFB:8, DCID/binary, NewPN/binary, CipherPayload/binary>>;
@@ -1053,16 +1151,17 @@ find_long_pn_offset(Packet) ->
     BaseOffset = 1 + 4 + 1 + DCIDLen + 1 + SCIDLen,
     <<FB:8, _/binary>> = Packet,
     Type = (FB band 16#30) bsr 4,
-    TokenFieldLen = case Type of
+    {TokenFieldLen, R2} = case Type of
         ?INITIAL_PACKET ->
-            {TLen, _} = quic_varint:decode(Rest),
-            quic_varint:encode_len(TLen) + TLen;
+            {TLen, R1} = quic_varint:decode(Rest),
+            TokenVarIntLen = byte_size(Rest) - byte_size(R1),
+            <<_Token:TLen/binary, AfterToken/binary>> = R1,
+            {TokenVarIntLen + TLen, AfterToken};
         _ ->
-            0
+            {0, Rest}
     end,
-    AfterToken = binary:part(Rest, TokenFieldLen, byte_size(Rest) - TokenFieldLen),
-    {Length, _} = quic_varint:decode(AfterToken),
-    LenFieldLen = quic_varint:encode_len(Length),
+    {_Length, R3} = quic_varint:decode(R2),
+    LenFieldLen = byte_size(R2) - byte_size(R3),
     BaseOffset + TokenFieldLen + LenFieldLen.
 
 hp_mask(HPKey, Sample) when byte_size(HPKey) =:= 16 ->
@@ -1163,12 +1262,45 @@ maybe_deliver_stream_data(StreamId, Stream, Data) ->
             end
     end.
 
-maybe_transition_to_established(Data) ->
-    %% Check if handshake is complete (app keys available)
-    case Data#conn_data.app_keys of
-        undefined ->
+%% Drain all available packets from the socket during handshake.
+%% Needed because multiple server response datagrams may arrive
+%% before the next select notification.
+handshake_drain(Socket, Data) ->
+    case socket:recvfrom(Socket, 0, [], nowait) of
+        {ok, {_Source, PacketData}} ->
+            io:format("[conn:~p] handshake drain recv, ~p bytes~n", [self(), byte_size(PacketData)]),
+            case process_received_packet(PacketData, Data) of
+                {ok, Data2} ->
+                    io:format("[conn:~p] handshake drain OK, hs_done=~p~n",
+                              [self(), Data2#conn_data.handshake_done]),
+                    %% Send ACK if handshake just completed
+                    Data3 = case Data2#conn_data.handshake_done of
+                        true -> send_handshake_ack(Data2);
+                        false -> Data2
+                    end,
+                    %% Try to read more packets immediately
+                    self() ! {handshake_drain, Socket},
+                    maybe_transition_to_established(Data3);
+                {error, Reason} ->
+                    io:format("[conn:~p] handshake drain FAILED: ~p~n", [self(), Reason]),
+                    start_recv(Socket),
+                    {keep_state, Data}
+            end;
+        {select, _} ->
+            %% No more data available, wait for next notification
             {keep_state, Data};
-        _ ->
+        {error, _} ->
+            {keep_state, Data}
+    end.
+
+maybe_transition_to_established(Data) ->
+    %% Check if handshake is fully complete (app keys + TLS handshake done)
+    case {Data#conn_data.app_keys, Data#conn_data.handshake_done} of
+        {undefined, _} ->
+            {keep_state, Data};
+        {_, false} ->
+            {keep_state, Data};
+        {_, true} ->
             %% Start idle timer
             IdleTimer = erlang:send_after(Data#conn_data.idle_timeout,
                                           self(), idle_timeout),
