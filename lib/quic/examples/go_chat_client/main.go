@@ -250,33 +250,35 @@ func (c *ChatApp) showJoinDialog() {
 	input := tview.NewInputField()
 	input.SetLabel("Room: #")
 	input.SetFieldWidth(30)
+	input.SetBorder(true)
+	input.SetTitle(" Join Room ")
+	input.SetTitleAlign(tview.AlignCenter)
 
-	form := tview.NewForm().
-		AddFormItem(input).
-		AddButton("Join", func() {
+	dismissDialog := func() {
+		c.mainPages.SwitchToPage("main")
+		c.mainPages.RemovePage("join-dialog")
+		c.app.SetFocus(c.inputField)
+	}
+
+	input.SetDoneFunc(func(key tcell.Key) {
+		switch key {
+		case tcell.KeyEnter:
 			name := strings.TrimSpace(input.GetText())
 			if name != "" {
-				c.mainPages.SwitchToPage("main")
-				c.mainPages.RemovePage("join-dialog")
-				c.app.SetFocus(c.inputField)
+				dismissDialog()
 				go c.joinRoom(name)
 			}
-		}).
-		AddButton("Cancel", func() {
-			c.mainPages.SwitchToPage("main")
-			c.mainPages.RemovePage("join-dialog")
-			c.app.SetFocus(c.inputField)
-		})
-	form.SetBorder(true)
-	form.SetTitle(" Join Room ")
-	form.SetTitleAlign(tview.AlignCenter)
+		case tcell.KeyEscape:
+			dismissDialog()
+		}
+	})
 
 	// Center the dialog
 	modal := tview.NewFlex().
 		AddItem(nil, 0, 1, false).
 		AddItem(tview.NewFlex().SetDirection(tview.FlexRow).
 			AddItem(nil, 0, 1, false).
-			AddItem(form, 9, 0, true).
+			AddItem(input, 3, 0, true).
 			AddItem(nil, 0, 1, false), 50, 0, true).
 		AddItem(nil, 0, 1, false)
 
@@ -534,14 +536,15 @@ func (c *ChatApp) switchToRoom(name string) {
 	c.mu.Lock()
 	_, ok := c.rooms[name]
 	c.mu.Unlock()
-	if !ok {
+	if !ok || c.activeRoom == name {
 		return
 	}
 
 	c.activeRoom = name
 	c.chatPages.SwitchToPage(name)
 
-	// Highlight in room list
+	// Highlight in room list (SetCurrentItem triggers ChangedFunc,
+	// but the guard above prevents re-entry)
 	for i := 0; i < c.roomList.GetItemCount(); i++ {
 		mainText, _ := c.roomList.GetItemText(i)
 		if strings.TrimPrefix(mainText, "#") == name {
