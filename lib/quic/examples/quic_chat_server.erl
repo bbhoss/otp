@@ -22,23 +22,31 @@
 
 %% quic_chat_server - Multi-room Chat Server over QUIC
 %%
-%% Demonstrates gen_quic active mode with a real application protocol.
+%% Demonstrates gen_quic active mode with QUIC stream multiplexing.
+%% Each chat room is carried on its own QUIC bidirectional stream,
+%% showcasing independent, non-head-of-line-blocking communication.
 %%
-%% Protocol (length-prefixed JSON on a single bidirectional stream):
+%% Protocol (length-prefixed JSON, one stream per room):
 %%
 %%   Wire format:  <<Length:32/big, JSON:Length/binary>>
 %%
-%%   Client -> Server:
-%%     {"cmd":"join",  "room":"lobby",  "nick":"alice"}
-%%     {"cmd":"msg",   "text":"hello everyone"}
-%%     {"cmd":"leave"}
+%%   A client opens a NEW QUIC stream for each room it wants to join.
+%%   The first message on a stream must be a join command:
 %%
-%%   Server -> Client:
+%%   Client -> Server (on new stream):
+%%     {"cmd":"join",  "room":"lobby",  "nick":"alice"}
+%%
+%%   Then on that same stream:
+%%     {"cmd":"msg",   "text":"hello everyone"}
+%%
+%%   Server -> Client (on the room's stream):
 %%     {"ev":"joined",  "room":"lobby",  "members":["bob"]}
 %%     {"ev":"msg",     "room":"lobby",  "nick":"bob",  "text":"hi"}
 %%     {"ev":"enter",   "room":"lobby",  "nick":"alice"}
 %%     {"ev":"left",    "room":"lobby",  "nick":"bob"}
 %%     {"ev":"error",   "text":"not in a room"}
+%%
+%%   Closing the stream = leaving the room.
 %%
 %% Usage:
 %%   {ok, Pid} = quic_chat_server:start(4433, "cert.pem", "key.pem").
@@ -49,7 +57,7 @@
 -export([start/3, stop/1]).
 
 %% Internal exports for spawn_link
--export([acceptor_loop/1, connection_handler/2, room_proc/1]).
+-export([acceptor_loop/1, connection_handler/2, room_proc/2]).
 
 %%--------------------------------------------------------------------
 %% Public API
@@ -92,19 +100,19 @@ acceptor_loop(Listener) ->
     end.
 
 %%--------------------------------------------------------------------
-%% Connection handler: one per QUIC connection, processes chat messages
+%% Connection handler: one per QUIC connection
 %%
-%% State tracks: the connection, the single control stream, the
-%% user's current room pid, nickname, and a recv buffer for
-%% reassembling length-prefixed frames.
+%% Manages MULTIPLE streams, each mapped to a room.
+%% This is the key multiplexing demonstration: each room lives on
+%% its own independent QUIC stream with zero head-of-line blocking.
 %%--------------------------------------------------------------------
 
 -record(client, {
     conn,
-    stream = undefined,
-    room = undefined,      %% {RoomName, RoomPid} | undefined
     nick = undefined,
-    buf = <<>>
+    %% #{StreamRef => {RoomName, RoomPid, Buffer} | {pending, Buffer}}
+    %% 'pending' means the stream opened but hasn't sent a join yet
+    streams = #{}
 }).
 
 connection_handler(Conn, _Parent) ->
@@ -112,127 +120,171 @@ connection_handler(Conn, _Parent) ->
 
 client_loop(#client{conn = Conn} = St) ->
     receive
-        %% A new stream was opened by the peer — this is the control stream
+        %% A new stream was opened by the peer
         {quic_stream_opened, Conn, Stream} ->
             io:format("[chat] Stream opened: ~p~n", [Stream]),
-            client_loop(St#client{stream = Stream});
+            Streams = St#client.streams,
+            client_loop(St#client{streams = Streams#{Stream => {pending, <<>>}}});
 
-        %% Data arrived on the control stream
-        {quic, _Stream, Data} ->
-            NewBuf = <<(St#client.buf)/binary, Data/binary>>,
-            St2 = process_frames(St#client{buf = NewBuf}),
-            client_loop(St2);
+        %% Data arrived on a stream
+        {quic, Stream, Data} ->
+            case maps:get(Stream, St#client.streams, undefined) of
+                undefined ->
+                    %% Unknown stream, ignore
+                    client_loop(St);
+                {pending, Buf} ->
+                    %% Stream not yet joined — buffer data and try to parse join
+                    NewBuf = <<Buf/binary, Data/binary>>,
+                    St2 = process_pending_stream(St, Stream, NewBuf),
+                    client_loop(St2);
+                {RoomName, RoomPid, Buf} ->
+                    %% Stream is bound to a room — process commands
+                    NewBuf = <<Buf/binary, Data/binary>>,
+                    {NewBuf2, St2} = process_room_frames(St, Stream, RoomName, RoomPid, NewBuf),
+                    Streams = St2#client.streams,
+                    client_loop(St2#client{streams = Streams#{Stream => {RoomName, RoomPid, NewBuf2}}})
+            end;
 
-        %% Room broadcast: a message from another user in our room
-        {room_msg, Msg} ->
-            send_event(St, Msg),
+        %% Room broadcast: a message from another user
+        {room_msg, RoomName, Msg} ->
+            %% Find the stream for this room and send the event
+            send_to_room_stream(St, RoomName, Msg),
             client_loop(St);
 
-        %% Stream / connection lifecycle
-        {quic_stream_closed, _Stream} ->
-            leave_room(St),
-            client_loop(St#client{stream = undefined});
+        %% Stream closed — leave that room
+        {quic_stream_closed, Stream} ->
+            St2 = handle_stream_close(St, Stream),
+            client_loop(St2);
 
+        %% Connection closed — leave all rooms
         {quic_closed, Conn} ->
             io:format("[chat] Connection closed~n"),
-            leave_room(St);
+            leave_all_rooms(St);
 
         {quic_error, _Ref, Reason} ->
             io:format("[chat] Error: ~p~n", [Reason]),
-            leave_room(St)
+            leave_all_rooms(St)
     end.
 
 %%--------------------------------------------------------------------
-%% Frame parsing: extract complete <<Len:32, Payload:Len/binary>>
+%% Process a pending stream (waiting for join command)
 %%--------------------------------------------------------------------
 
-process_frames(#client{buf = Buf} = St) when byte_size(Buf) < 4 ->
-    St;
-process_frames(#client{buf = <<Len:32/big, Rest/binary>>} = St)
+process_pending_stream(St, Stream, Buf) when byte_size(Buf) < 4 ->
+    Streams = St#client.streams,
+    St#client{streams = Streams#{Stream => {pending, Buf}}};
+process_pending_stream(St, Stream, <<Len:32/big, Rest/binary>> = Buf)
   when byte_size(Rest) < Len ->
-    St;
-process_frames(#client{buf = <<Len:32/big, Rest/binary>>} = St) ->
+    Streams = St#client.streams,
+    St#client{streams = Streams#{Stream => {pending, Buf}}};
+process_pending_stream(St, Stream, <<Len:32/big, Rest/binary>>) ->
     <<Payload:Len/binary, Tail/binary>> = Rest,
-    St2 = handle_command(St#client{buf = Tail}, Payload),
-    process_frames(St2).
-
-%%--------------------------------------------------------------------
-%% Command dispatch
-%%--------------------------------------------------------------------
-
-handle_command(St, JsonBin) ->
-    case catch json:decode(JsonBin) of
-        {'EXIT', _} ->
-            send_event(St, #{<<"ev">> => <<"error">>,
-                             <<"text">> => <<"bad json">>}),
-            St;
-        Map when is_map(Map) ->
-            dispatch(St, Map);
+    case catch json:decode(Payload) of
+        #{<<"cmd">> := <<"join">>, <<"room">> := RoomName, <<"nick">> := Nick} ->
+            RoomPid = get_or_create_room(RoomName),
+            RoomPid ! {join, self(), Nick},
+            receive
+                {joined, Members} ->
+                    send_event_on(Stream, #{<<"ev">> => <<"joined">>,
+                                            <<"room">> => RoomName,
+                                            <<"members">> => Members}),
+                    io:format("[chat] ~s joined room ~s (stream ~p)~n",
+                              [Nick, RoomName, Stream]),
+                    Streams = St#client.streams,
+                    St#client{
+                        nick = Nick,
+                        streams = Streams#{Stream => {RoomName, RoomPid, Tail}}
+                    }
+            after 5000 ->
+                send_event_on(Stream, #{<<"ev">> => <<"error">>,
+                                        <<"text">> => <<"join timeout">>}),
+                Streams = St#client.streams,
+                St#client{streams = Streams#{Stream => {pending, Tail}}}
+            end;
         _ ->
-            send_event(St, #{<<"ev">> => <<"error">>,
-                             <<"text">> => <<"expected object">>}),
-            St
+            send_event_on(Stream, #{<<"ev">> => <<"error">>,
+                                    <<"text">> => <<"first command must be join">>}),
+            Streams = St#client.streams,
+            St#client{streams = Streams#{Stream => {pending, Tail}}}
     end.
 
-dispatch(St, #{<<"cmd">> := <<"join">>,
-               <<"room">> := RoomName,
-               <<"nick">> := Nick}) ->
-    %% Leave current room first if any
-    leave_room(St),
-    RoomPid = get_or_create_room(RoomName),
-    RoomPid ! {join, self(), Nick},
-    receive
-        {joined, Members} ->
-            send_event(St, #{<<"ev">> => <<"joined">>,
-                             <<"room">> => RoomName,
-                             <<"members">> => Members}),
-            St#client{room = {RoomName, RoomPid}, nick = Nick}
-    after 5000 ->
-        send_event(St, #{<<"ev">> => <<"error">>,
-                         <<"text">> => <<"join timeout">>}),
-        St
-    end;
+%%--------------------------------------------------------------------
+%% Process frames on a stream that's bound to a room
+%%--------------------------------------------------------------------
 
-dispatch(St, #{<<"cmd">> := <<"msg">>, <<"text">> := Text}) ->
-    case St#client.room of
-        {_RoomName, RoomPid} ->
+process_room_frames(St, _Stream, _RoomName, _RoomPid, Buf) when byte_size(Buf) < 4 ->
+    {Buf, St};
+process_room_frames(St, _Stream, _RoomName, _RoomPid, <<Len:32/big, Rest/binary>> = Buf)
+  when byte_size(Rest) < Len ->
+    {Buf, St};
+process_room_frames(St, Stream, RoomName, RoomPid, <<Len:32/big, Rest/binary>>) ->
+    <<Payload:Len/binary, Tail/binary>> = Rest,
+    St2 = handle_room_command(St, Stream, RoomName, RoomPid, Payload),
+    process_room_frames(St2, Stream, RoomName, RoomPid, Tail).
+
+handle_room_command(St, _Stream, _RoomName, RoomPid, Payload) ->
+    case catch json:decode(Payload) of
+        #{<<"cmd">> := <<"msg">>, <<"text">> := Text} ->
             RoomPid ! {chat, self(), St#client.nick, Text},
             St;
-        undefined ->
-            send_event(St, #{<<"ev">> => <<"error">>,
-                             <<"text">> => <<"not in a room">>}),
+        _ ->
             St
-    end;
-
-dispatch(St, #{<<"cmd">> := <<"leave">>}) ->
-    leave_room(St),
-    send_event(St, #{<<"ev">> => <<"left_ok">>}),
-    St#client{room = undefined, nick = undefined};
-
-dispatch(St, _Other) ->
-    send_event(St, #{<<"ev">> => <<"error">>,
-                     <<"text">> => <<"unknown command">>}),
-    St.
+    end.
 
 %%--------------------------------------------------------------------
-%% Send a JSON event back to the client (length-prefixed)
+%% Send a JSON event on a specific stream (length-prefixed)
 %%--------------------------------------------------------------------
 
-send_event(#client{stream = undefined}, _Msg) ->
-    ok;
-send_event(#client{stream = Stream}, Msg) ->
+send_event_on(Stream, Msg) ->
     Json = json:encode(Msg),
     Len = byte_size(Json),
     gen_quic:send(Stream, <<Len:32/big, Json/binary>>).
 
 %%--------------------------------------------------------------------
-%% Room helpers
+%% Find the stream for a given room and send an event
 %%--------------------------------------------------------------------
 
-leave_room(#client{room = undefined}) -> ok;
-leave_room(#client{room = {_Name, RoomPid}, nick = Nick}) ->
-    RoomPid ! {leave, self(), Nick},
+send_to_room_stream(#client{streams = Streams}, RoomName, Msg) ->
+    maps:foreach(fun(Stream, {Name, _Pid, _Buf}) when Name =:= RoomName ->
+        send_event_on(Stream, Msg);
+    (_Stream, _Info) ->
+        ok
+    end, Streams).
+
+%%--------------------------------------------------------------------
+%% Handle stream close — leave the associated room
+%%--------------------------------------------------------------------
+
+handle_stream_close(St, Stream) ->
+    case maps:get(Stream, St#client.streams, undefined) of
+        undefined ->
+            St;
+        {pending, _Buf} ->
+            Streams = maps:remove(Stream, St#client.streams),
+            St#client{streams = Streams};
+        {RoomName, RoomPid, _Buf} ->
+            RoomPid ! {leave, self(), St#client.nick},
+            io:format("[chat] ~s left room ~s (stream closed)~n",
+                      [St#client.nick, RoomName]),
+            Streams = maps:remove(Stream, St#client.streams),
+            St#client{streams = Streams}
+    end.
+
+%%--------------------------------------------------------------------
+%% Leave all rooms (connection closing)
+%%--------------------------------------------------------------------
+
+leave_all_rooms(#client{streams = Streams, nick = Nick}) ->
+    maps:foreach(fun(_Stream, {_RoomName, RoomPid, _Buf}) ->
+        RoomPid ! {leave, self(), Nick};
+    (_Stream, _) ->
+        ok
+    end, Streams),
     ok.
+
+%%--------------------------------------------------------------------
+%% Room helpers
+%%--------------------------------------------------------------------
 
 get_or_create_room(RoomName) ->
     quic_chat_rooms ! {get_or_create, self(), RoomName},
@@ -251,7 +303,7 @@ room_manager(Rooms) ->
         {get_or_create, From, Name} ->
             case maps:get(Name, Rooms, undefined) of
                 undefined ->
-                    Pid = spawn_link(fun() -> room_proc(#{}) end),
+                    Pid = spawn_link(fun() -> room_proc(Name, #{}) end),
                     io:format("[chat] Created room ~s (~p)~n", [Name, Pid]),
                     From ! {room_pid, Pid},
                     room_manager(Rooms#{Name => Pid});
@@ -265,28 +317,31 @@ room_manager(Rooms) ->
 %% Room process: manages members and broadcasts messages
 %%
 %% Members map: #{Pid => Nick}
+%%
+%% Broadcasts include the room name so the connection handler
+%% can route to the correct stream.
 %%--------------------------------------------------------------------
 
-room_proc(Members) ->
+room_proc(RoomName, Members) ->
     receive
         {join, Pid, Nick} ->
             %% Notify existing members
             maps:foreach(fun(P, _N) ->
-                P ! {room_msg, #{<<"ev">> => <<"enter">>,
-                                 <<"nick">> => Nick}}
+                P ! {room_msg, RoomName, #{<<"ev">> => <<"enter">>,
+                                           <<"nick">> => Nick}}
             end, Members),
             %% Send current member list to the joiner
             Nicks = maps:values(Members),
             Pid ! {joined, Nicks},
             monitor(process, Pid),
-            room_proc(Members#{Pid => Nick});
+            room_proc(RoomName, Members#{Pid => Nick});
 
         {leave, Pid, Nick} ->
             Members2 = maps:remove(Pid, Members),
-            broadcast(Members2, #{<<"ev">> => <<"left">>,
-                                  <<"nick">> => Nick}),
-            io:format("[chat] ~s left room~n", [Nick]),
-            room_proc(Members2);
+            broadcast(Members2, RoomName, #{<<"ev">> => <<"left">>,
+                                            <<"nick">> => Nick}),
+            io:format("[chat] ~s left room ~s~n", [Nick, RoomName]),
+            room_proc(RoomName, Members2);
 
         {chat, FromPid, Nick, Text} ->
             Msg = #{<<"ev">> => <<"msg">>,
@@ -294,23 +349,23 @@ room_proc(Members) ->
                     <<"text">> => Text},
             %% Send to all members except the sender
             maps:foreach(fun(P, _N) when P =/= FromPid ->
-                P ! {room_msg, Msg};
+                P ! {room_msg, RoomName, Msg};
             (_P, _N) -> ok
             end, Members),
-            room_proc(Members);
+            room_proc(RoomName, Members);
 
         {'DOWN', _Ref, process, Pid, _Reason} ->
             case maps:get(Pid, Members, undefined) of
                 undefined ->
-                    room_proc(Members);
+                    room_proc(RoomName, Members);
                 Nick ->
                     Members2 = maps:remove(Pid, Members),
-                    broadcast(Members2, #{<<"ev">> => <<"left">>,
-                                          <<"nick">> => Nick}),
-                    io:format("[chat] ~s disconnected~n", [Nick]),
-                    room_proc(Members2)
+                    broadcast(Members2, RoomName, #{<<"ev">> => <<"left">>,
+                                                    <<"nick">> => Nick}),
+                    io:format("[chat] ~s disconnected from ~s~n", [Nick, RoomName]),
+                    room_proc(RoomName, Members2)
             end
     end.
 
-broadcast(Members, Msg) ->
-    maps:foreach(fun(P, _N) -> P ! {room_msg, Msg} end, Members).
+broadcast(Members, RoomName, Msg) ->
+    maps:foreach(fun(P, _N) -> P ! {room_msg, RoomName, Msg} end, Members).
