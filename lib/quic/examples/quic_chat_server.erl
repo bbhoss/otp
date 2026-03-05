@@ -180,7 +180,7 @@ process_pending_stream(St, Stream, <<Len:32/big, Rest/binary>> = Buf)
     St#client{streams = Streams#{Stream => {pending, Buf}}};
 process_pending_stream(St, Stream, <<Len:32/big, Rest/binary>>) ->
     <<Payload:Len/binary, Tail/binary>> = Rest,
-    case catch quic_chat_json:decode(Payload) of
+    case catch json:decode(Payload) of
         #{<<"cmd">> := <<"join">>, <<"room">> := RoomName, <<"nick">> := Nick} ->
             RoomPid = get_or_create_room(RoomName),
             RoomPid ! {join, self(), Nick},
@@ -224,7 +224,7 @@ process_room_frames(St, Stream, RoomName, RoomPid, <<Len:32/big, Rest/binary>>) 
     process_room_frames(St2, Stream, RoomName, RoomPid, Tail).
 
 handle_room_command(St, _Stream, _RoomName, RoomPid, Payload) ->
-    case catch quic_chat_json:decode(Payload) of
+    case catch json:decode(Payload) of
         #{<<"cmd">> := <<"msg">>, <<"text">> := Text} ->
             RoomPid ! {chat, self(), St#client.nick, Text},
             St;
@@ -237,10 +237,11 @@ handle_room_command(St, _Stream, _RoomName, RoomPid, Payload) ->
 %%--------------------------------------------------------------------
 
 send_event_on(Stream, Msg) ->
-    Json = quic_chat_json:encode(Msg),
-    Len = byte_size(Json),
-    io:format("[chat] Sending on ~p: ~s~n", [Stream, Json]),
-    gen_quic:send(Stream, <<Len:32/big, Json/binary>>).
+    Json = json:encode(Msg),
+    Bin = iolist_to_binary(Json),
+    Len = byte_size(Bin),
+    io:format("[chat] Sending on ~p: ~s~n", [Stream, Bin]),
+    gen_quic:send(Stream, <<Len:32/big, Bin/binary>>).
 
 %%--------------------------------------------------------------------
 %% Find the stream for a given room and send an event
