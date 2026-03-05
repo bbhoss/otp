@@ -116,7 +116,11 @@
     %% PTO timer
     pto_timer           :: reference() | undefined,
     %% Handshake complete flag (set when TLS handshake_complete action received)
-    handshake_done = false :: boolean()
+    handshake_done = false :: boolean(),
+    %% Key update state (RFC 9001 Section 6)
+    key_phase = 0          :: 0 | 1,
+    client_app_secret      :: binary() | undefined,
+    server_app_secret      :: binary() | undefined
 }).
 
 %% ===================================================================
@@ -308,11 +312,8 @@ idle(info, Msg, Data) ->
 %% ===================================================================
 
 handshake(cast, {packet, PacketData, _PeerAddr}, Data) ->
-    io:format("[conn:~p] handshake got packet, ~p bytes~n", [self(), byte_size(PacketData)]),
     case process_received_packet(PacketData, Data) of
         {ok, Data2} ->
-            io:format("[conn:~p] handshake packet OK, hs_done=~p~n",
-                      [self(), Data2#conn_data.handshake_done]),
             %% If handshake just completed, send ACK for client's Handshake
             Data3 = case Data2#conn_data.handshake_done of
                 true -> send_handshake_ack(Data2);
@@ -616,8 +617,8 @@ process_initial_packet(PacketData, Data) ->
     %% Parse the unprotected parts of the Initial packet to get DCID
     case quic_packet:decode_header(PacketData) of
         {ok, #quic_packet{type = initial, dcid = DCID, scid = PeerSCID} = _Pkt, _Rest} ->
-            io:format("[conn:~p] Initial: DCID=~p (~p bytes), PeerSCID=~p (~p bytes)~n",
-                      [self(), DCID, byte_size(DCID), PeerSCID, byte_size(PeerSCID)]),
+            io:format("[conn:~p] Initial: DCID=~p, PeerSCID=~p~n",
+                      [self(), DCID, PeerSCID]),
             %% Derive initial keys from client's DCID
             InitialKeys = quic_crypto:derive_initial_keys(DCID),
 
@@ -730,13 +731,8 @@ process_long_header_packet(PacketData, Data) ->
                         server ->
                             maps:get(client, HSKeys)
                     end,
-                    {CK, CIV, CHP} = Keys,
-                    io:format("[conn:~p] HS decrypt: key=~p~n  iv=~p~n  hp=~p~n  pkt_size=~p~n  raw=~p~n",
-                              [self(), CK, CIV, CHP, byte_size(PacketData), PacketData]),
                     case quic_crypto:unprotect_packet(PacketData, 0, Keys, true) of
                         {ok, _Header, Payload, _PN} ->
-                            io:format("[conn:~p] HS decrypt OK, PN=~p, payload=~p bytes~n",
-                                      [self(), _PN, byte_size(Payload)]),
                             case quic_frame:decode_all(Payload) of
                                 {ok, Frames} ->
                                     process_frames(Frames, handshake, Data);
@@ -754,41 +750,105 @@ process_long_header_packet(PacketData, Data) ->
 process_short_header_packet(PacketData, Data) ->
     case Data#conn_data.app_keys of
         undefined ->
-            io:format("[conn:~p] 1-RTT packet but no app_keys~n", [self()]),
             {error, no_app_keys};
         AppKeys ->
             Keys = case Data#conn_data.role of
                 client -> maps:get(server, AppKeys);
                 server -> maps:get(client, AppKeys)
             end,
-            {CK, CIV, CHP} = Keys,
             DCIDLen = byte_size(Data#conn_data.scid),
-            io:format("[conn:~p] 1-RTT decrypt: DCIDLen=~p, pkt_size=~p~n  key=~w~n  iv=~w~n  hp=~w~n  raw_hex=~s~n",
-                      [self(), DCIDLen, byte_size(PacketData), CK, CIV, CHP,
-                       binary:encode_hex(PacketData)]),
-            case quic_crypto:unprotect_packet(PacketData, 0, Keys, false, DCIDLen) of
+            PNSpaces = Data#conn_data.pn_spaces,
+            AppPNSpace = maps:get(application, PNSpaces),
+            LargestRecv = max(0, AppPNSpace#pn_space.largest_received),
+            case quic_crypto:unprotect_packet(PacketData, LargestRecv, Keys, false, DCIDLen) of
                 {ok, _Header, Payload, PN} ->
-                    io:format("[conn:~p] 1-RTT decrypt OK, PN=~p, payload=~p bytes~n",
-                              [self(), PN, byte_size(Payload)]),
-                    case quic_frame:decode_all(Payload) of
-                        {ok, Frames} ->
-                            io:format("[conn:~p] 1-RTT frames: ~p~n", [self(), Frames]),
-                            case process_frames(Frames, application, Data) of
-                                {ok, Data2} ->
-                                    %% Send ACK for received 1-RTT packet
-                                    Data3 = send_app_ack(PN, Data2),
-                                    {ok, Data3};
-                                {error, _} = Err2 ->
-                                    Err2
-                            end;
-                        {error, _} = Err ->
-                            io:format("[conn:~p] 1-RTT frame decode error: ~p~n", [self(), Err]),
-                            Err
+                    process_decrypted_1rtt(Payload, PN, AppPNSpace, PNSpaces, Data);
+                {error, {decrypt_failed, #{unprot_fb := FirstByte}}} ->
+                    PktKeyPhase = (FirstByte bsr 2) band 1,
+                    case PktKeyPhase =/= Data#conn_data.key_phase of
+                        true ->
+                            try_key_update(PacketData, Keys, DCIDLen, LargestRecv,
+                                           AppPNSpace, PNSpaces, Data);
+                        false ->
+                            {error, decrypt_failed}
                     end;
                 {error, _} = Err ->
-                    io:format("[conn:~p] 1-RTT decrypt FAILED: ~p~n", [self(), Err]),
                     Err
             end
+    end.
+
+try_key_update(PacketData, OldPeerKeys, DCIDLen, LargestRecv,
+               AppPNSpace, PNSpaces, Data) ->
+    PeerSecret = case Data#conn_data.role of
+        client -> Data#conn_data.server_app_secret;
+        server -> Data#conn_data.client_app_secret
+    end,
+    OwnSecret = case Data#conn_data.role of
+        client -> Data#conn_data.client_app_secret;
+        server -> Data#conn_data.server_app_secret
+    end,
+    case PeerSecret of
+        undefined ->
+            {error, no_traffic_secret_for_key_update};
+        _ ->
+            {_OldKey, _OldIV, HPKey} = OldPeerKeys,
+            {NewPeerSecret, {NewKey, NewIV}} =
+                quic_crypto:next_key_update(PeerSecret, sha256, 16),
+            NewPeerKeys = {NewKey, NewIV, HPKey},
+            case quic_crypto:unprotect_packet(PacketData, LargestRecv,
+                                              NewPeerKeys, false, DCIDLen) of
+                {ok, _Header, Payload, PN} ->
+                    io:format("[conn:~p] key update at PN=~p~n", [self(), PN]),
+                    {NewOwnSecret, {NewOwnKey, NewOwnIV}} =
+                        quic_crypto:next_key_update(OwnSecret, sha256, 16),
+                    OldAppKeys = Data#conn_data.app_keys,
+                    {_, _, OwnHPKey} = case Data#conn_data.role of
+                        client -> maps:get(client, OldAppKeys);
+                        server -> maps:get(server, OldAppKeys)
+                    end,
+                    NewAppKeys = case Data#conn_data.role of
+                        client ->
+                            #{client => {NewOwnKey, NewOwnIV, OwnHPKey},
+                              server => NewPeerKeys};
+                        server ->
+                            #{client => NewPeerKeys,
+                              server => {NewOwnKey, NewOwnIV, OwnHPKey}}
+                    end,
+                    {NewClientSecret, NewServerSecret} = case Data#conn_data.role of
+                        client -> {NewOwnSecret, NewPeerSecret};
+                        server -> {NewPeerSecret, NewOwnSecret}
+                    end,
+                    Data1 = Data#conn_data{
+                        app_keys = NewAppKeys,
+                        key_phase = 1 - Data#conn_data.key_phase,
+                        client_app_secret = NewClientSecret,
+                        server_app_secret = NewServerSecret
+                    },
+                    process_decrypted_1rtt(Payload, PN, AppPNSpace, PNSpaces, Data1);
+                {error, _} ->
+                    {error, decrypt_failed}
+            end
+    end.
+
+process_decrypted_1rtt(Payload, PN, AppPNSpace, PNSpaces, Data) ->
+    RecvPNs = lists:usort([PN | AppPNSpace#pn_space.received_pns]),
+    NewAppPNSpace = AppPNSpace#pn_space{
+        largest_received = max(PN, AppPNSpace#pn_space.largest_received),
+        received_pns = RecvPNs
+    },
+    NewPNSpaces = PNSpaces#{application => NewAppPNSpace},
+    Data1 = Data#conn_data{pn_spaces = NewPNSpaces},
+    case quic_frame:decode_all(Payload) of
+        {ok, Frames} ->
+            case process_frames(Frames, application, Data1) of
+                {ok, Data2} ->
+                    Data3 = send_app_ack(PN, Data2),
+                    {ok, Data3};
+                {error, _} = Err2 ->
+                    Err2
+            end;
+        {error, _} = Err ->
+            Err
     end.
 
 process_frames([], _Level, Data) ->
@@ -938,15 +998,15 @@ process_tls_action({send_crypto, Level, CryptoData}, Data) ->
     send_crypto_data(CryptoData, Level, Data);
 
 process_tls_action({handshake_keys, Keys}, Data) ->
-    #{client := {CK, CIV, CHP}, server := {SK, SIV, SHP}} = Keys,
-    io:format("[conn:~p] HS KEYS installed:~n  client_key=~p~n  client_iv=~p~n  client_hp=~p~n  server_key=~p~n  server_iv=~p~n  server_hp=~p~n",
-              [self(), CK, CIV, CHP, SK, SIV, SHP]),
     Data#conn_data{handshake_keys = Keys};
 
+process_tls_action({application_keys, Keys, ClientSecret, ServerSecret}, Data) ->
+    io:format("[conn:~p] app keys installed~n", [self()]),
+    Data#conn_data{app_keys = Keys,
+                   client_app_secret = ClientSecret,
+                   server_app_secret = ServerSecret};
 process_tls_action({application_keys, Keys}, Data) ->
-    #{client := {ACK, ACIV, ACHP}, server := {ASK, ASIV, ASHP}} = Keys,
-    io:format("[conn:~p] APP KEYS installed:~n  client_key=~p~n  client_iv=~p~n  client_hp=~p~n  server_key=~p~n  server_iv=~p~n  server_hp=~p~n",
-              [self(), ACK, ACIV, ACHP, ASK, ASIV, ASHP]),
+    io:format("[conn:~p] app keys installed (no secrets)~n", [self()]),
     Data#conn_data{app_keys = Keys};
 
 process_tls_action({handshake_complete, _ALPN, RemoteParams}, Data) ->
@@ -999,8 +1059,6 @@ send_crypto_data(CryptoData, initial, Data) ->
 
 send_crypto_data(CryptoData, handshake, Data) ->
     CryptoFrame = quic_frame:encode({crypto, 0, CryptoData}),
-    io:format("[conn:~p] HS send: crypto_data=~p, crypto_frame=~p~n",
-              [self(), byte_size(CryptoData), byte_size(CryptoFrame)]),
     HSKeys = Data#conn_data.handshake_keys,
     Keys = case Data#conn_data.role of
         server -> maps:get(server, HSKeys);
@@ -1012,10 +1070,7 @@ send_crypto_data(CryptoData, handshake, Data) ->
 
     Packet = quic_packet:encode_handshake(
         Data#conn_data.dcid, Data#conn_data.scid, PN, CryptoFrame),
-    io:format("[conn:~p] HS plain packet=~p bytes~n", [self(), byte_size(Packet)]),
-
     ProtectedPacket = protect_long_packet(Packet, PN, Keys),
-    io:format("[conn:~p] HS protected packet=~p bytes~n", [self(), byte_size(ProtectedPacket)]),
     send_udp(ProtectedPacket, Data),
 
     NewPNSpaces = PNSpaces#{handshake => HSPN#pn_space{next_pn = PN + 1}},
@@ -1045,9 +1100,37 @@ send_handshake_ack(Data) ->
             Data#conn_data{pn_spaces = NewPNSpaces}
     end.
 
-send_app_ack(RecvPN, Data) ->
-    AckFrame = quic_frame:encode({ack, RecvPN, 0, [RecvPN]}),
-    send_app_data(AckFrame, Data).
+send_app_ack(_RecvPN, Data) ->
+    PNSpaces = Data#conn_data.pn_spaces,
+    AppPNSpace = maps:get(application, PNSpaces),
+    RecvPNs = AppPNSpace#pn_space.received_pns,
+    case RecvPNs of
+        [] -> Data;
+        _ ->
+            Ranges = build_ack_ranges(lists:reverse(RecvPNs)),
+            LargestAcked = hd(lists:reverse(RecvPNs)),
+            AckFrame = quic_frame:encode({ack, LargestAcked, 0, Ranges}),
+            send_app_data(AckFrame, Data)
+    end.
+
+build_ack_ranges(SortedDescPNs) ->
+    Blocks = group_contiguous(SortedDescPNs),
+    [{High, Low} | Rest] = Blocks,
+    [High - Low | build_gap_ranges(Rest, Low)].
+
+group_contiguous([PN | Rest]) ->
+    group_contiguous(Rest, PN, PN, []).
+
+group_contiguous([], High, Low, Acc) ->
+    lists:reverse([{High, Low} | Acc]);
+group_contiguous([PN | Rest], _High, Low, Acc) when Low - 1 =:= PN ->
+    group_contiguous(Rest, _High, PN, Acc);
+group_contiguous([PN | Rest], High, Low, Acc) ->
+    group_contiguous(Rest, PN, PN, [{High, Low} | Acc]).
+
+build_gap_ranges([], _PrevLow) -> [];
+build_gap_ranges([{High, Low} | Rest], PrevLow) ->
+    [{PrevLow - High - 2, High - Low} | build_gap_ranges(Rest, Low)].
 
 send_stream_frames(Frames, Data) ->
     FramesBin = iolist_to_binary([quic_frame:encode(F) || F <- Frames]),
@@ -1072,7 +1155,8 @@ send_app_data(FrameData, Data) ->
                 false -> FrameData
             end,
             Packet = quic_packet:encode_short(
-                Data#conn_data.dcid, PN, PaddedFrameData),
+                Data#conn_data.dcid, PN, PaddedFrameData,
+                Data#conn_data.key_phase),
             ProtectedPacket = protect_short_packet(Packet, PN, Keys,
                                                     byte_size(Data#conn_data.dcid)),
             send_udp(ProtectedPacket, Data),
@@ -1082,11 +1166,7 @@ send_app_data(FrameData, Data) ->
     end.
 
 send_udp(Packet, #conn_data{udp_socket = Socket, peer_addr = PeerAddr}) ->
-    io:format("[conn:~p] send_udp ~p bytes, first 20: ~w~n",
-              [self(), byte_size(Packet), binary:part(Packet, 0, min(20, byte_size(Packet)))]),
-    Result = socket:sendto(Socket, Packet, PeerAddr),
-    io:format("[conn:~p] send_udp result: ~p~n", [self(), Result]),
-    Result.
+    socket:sendto(Socket, Packet, PeerAddr).
 
 %% ===================================================================
 %% Packet Protection Helpers
@@ -1280,11 +1360,8 @@ maybe_deliver_stream_data(StreamId, Stream, Data) ->
 handshake_drain(Socket, Data) ->
     case socket:recvfrom(Socket, 0, [], nowait) of
         {ok, {_Source, PacketData}} ->
-            io:format("[conn:~p] handshake drain recv, ~p bytes~n", [self(), byte_size(PacketData)]),
             case process_received_packet(PacketData, Data) of
                 {ok, Data2} ->
-                    io:format("[conn:~p] handshake drain OK, hs_done=~p~n",
-                              [self(), Data2#conn_data.handshake_done]),
                     %% Send ACK if handshake just completed
                     Data3 = case Data2#conn_data.handshake_done of
                         true -> send_handshake_ack(Data2);
@@ -1294,7 +1371,6 @@ handshake_drain(Socket, Data) ->
                     self() ! {handshake_drain, Socket},
                     maybe_transition_to_established(Data3);
                 {error, Reason} ->
-                    io:format("[conn:~p] handshake drain FAILED: ~p~n", [self(), Reason]),
                     start_recv(Socket),
                     {keep_state, Data}
             end;

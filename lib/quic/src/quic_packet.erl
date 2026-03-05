@@ -37,6 +37,7 @@
     encode_initial/5,
     encode_handshake/4,
     encode_short/3,
+    encode_short/4,
     encode_zero_rtt/4,
     encode_retry/4,
     encode_version_negotiation/3,
@@ -74,10 +75,13 @@ encode_zero_rtt(DCID, SCID, PacketNumber, Payload) ->
 %% @doc Encode a Short Header (1-RTT) packet.
 -spec encode_short(binary(), non_neg_integer(), binary()) -> binary().
 encode_short(DCID, PacketNumber, Payload) ->
+    encode_short(DCID, PacketNumber, Payload, 0).
+
+-spec encode_short(binary(), non_neg_integer(), binary(), 0 | 1) -> binary().
+encode_short(DCID, PacketNumber, Payload, KeyPhase) ->
     PNLen = packet_number_length(PacketNumber),
     PNBin = encode_pn_bytes(PacketNumber, PNLen),
-    %% Short header: Form=0, Fixed=1, SpinBit=0, Reserved=00, KeyPhase=0, PNLen
-    FirstByte = 16#40 bor (PNLen - 1),
+    FirstByte = 16#40 bor (KeyPhase bsl 2) bor (PNLen - 1),
     Header = <<FirstByte:8, DCID/binary, PNBin/binary>>,
     <<Header/binary, Payload/binary>>.
 

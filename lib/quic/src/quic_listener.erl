@@ -146,7 +146,6 @@ listening(info, Msg, _Data) ->
 drain_socket(Socket, Data) ->
     case socket:recvfrom(Socket, 0, [], nowait) of
         {ok, {Source, PacketData}} ->
-            io:format("[listener] recv ~p bytes from ~p~n", [byte_size(PacketData), Source]),
             Data2 = handle_incoming_packet(PacketData, Source, Data),
             drain_socket(Socket, Data2);
         {select, _} ->
@@ -165,13 +164,11 @@ terminate(_Reason, _State, #listener_data{socket = Socket}) ->
 %% ===================================================================
 
 handle_incoming_packet(PacketData, Source, Data) ->
-    io:format("[listener] handle_incoming_packet, first_byte=~p~n", [binary:first(PacketData)]),
     case PacketData of
         <<1:1, _:7, _/binary>> ->
             %% Long header - extract DCID
             case extract_dcid(PacketData) of
                 {ok, DCID} ->
-                    io:format("[listener] long header, DCID=~p~n", [DCID]),
                     case maps:find(DCID, Data#listener_data.connections) of
                         {ok, ConnPid} ->
                             %% Route to existing connection

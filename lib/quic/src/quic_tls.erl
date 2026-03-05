@@ -320,7 +320,7 @@ process_message(?TLS_FINISHED, Msg, handshake,
                 {application_keys, #{
                     client => ClientAppKeys,
                     server => ServerAppKeys
-                }},
+                }, ClientAppSecret, ServerAppSecret},
                 {send_crypto, handshake, ClientFinMsg},
                 {handshake_complete, State2#tls_state.negotiated_alpn,
                  State2#tls_state.remote_params}
@@ -443,7 +443,7 @@ process_message(?TLS_CLIENT_HELLO, Msg, initial,
                 {application_keys, #{
                     client => ClientAppKeys,
                     server => ServerAppKeys
-                }}
+                }, ClientAppSecret, ServerAppSecret}
             ],
             {ok, Actions, State2};
         {error, _} = Error ->

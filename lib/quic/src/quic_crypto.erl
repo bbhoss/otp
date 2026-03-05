@@ -46,12 +46,14 @@
     protect_packet/4,
     unprotect_packet/4,
     unprotect_packet/5,
+    reconstruct_pn/3,
     hkdf_extract/2,
     hkdf_extract/3,
     hkdf_expand_label/4,
     hkdf_expand_label/6,
     initial_salt/1,
-    make_nonce/2
+    make_nonce/2,
+    next_key_update/3
 ]).
 
 %% Key set: {Key, IV, HP_Key}
@@ -98,6 +100,15 @@ derive_keys(Secret, HashAlgo, KeyLen) ->
 -spec derive_keys(binary(), atom(), pos_integer(), non_neg_integer()) -> key_set().
 derive_keys(Secret, HashAlgo, KeyLen, Version) ->
     derive_key_set(Secret, HashAlgo, KeyLen, Version).
+
+%% @doc Derive next-generation traffic secret and keys for key update (RFC 9001 Section 6).
+%% Returns {NewSecret, {NewKey, NewIV, OldHP}} - HP key does NOT change during key updates.
+-spec next_key_update(binary(), atom(), pos_integer()) -> {binary(), key_set()}.
+next_key_update(CurrentSecret, HashAlgo, KeyLen) ->
+    HashLen = hash_length(HashAlgo),
+    NextSecret = hkdf_expand_label(CurrentSecret, ?QUIC_V1_KU_LABEL, <<>>, HashLen, HashAlgo, ?TLS13_LABEL_PREFIX),
+    {Key, IV, _HP} = derive_key_set(NextSecret, HashAlgo, KeyLen, ?QUIC_V1),
+    {NextSecret, {Key, IV}}.
 
 %% ===================================================================
 %% AEAD Encryption/Decryption (RFC 9001, Section 5.3)
@@ -174,33 +185,27 @@ protect_packet(UnprotectedPacket, PacketNumber, {Key, IV, HPKey}, IsLong) ->
 %% @doc Full packet unprotection: unprotect header + decrypt payload.
 -spec unprotect_packet(binary(), non_neg_integer(), key_set(), boolean()) ->
     {ok, binary(), binary(), non_neg_integer()} | {error, term()}.
-unprotect_packet(ProtectedPacket, _LargestPN, {Key, IV, HPKey}, IsLong) ->
-    %% Find PN offset (we know the minimum position)
+unprotect_packet(ProtectedPacket, LargestPN, {Key, IV, HPKey}, IsLong) ->
     PNOffset = find_pn_offset(ProtectedPacket, IsLong),
 
-    %% Get sample: starts 4 bytes after PN offset
     SampleOffset = PNOffset + 4,
     case byte_size(ProtectedPacket) >= SampleOffset + 16 of
         false -> {error, packet_too_short};
         true ->
             <<_:SampleOffset/binary, Sample:16/binary, _/binary>> = ProtectedPacket,
 
-            %% Remove header protection
             Unprotected = unprotect_header(ProtectedPacket, HPKey, Sample, IsLong),
 
-            %% Now read the real PN length from first byte
             <<FirstByte:8, _/binary>> = Unprotected,
             PNLen = (FirstByte band 16#03) + 1,
 
-            %% Extract the packet number
             <<_:PNOffset/binary, PNBin:PNLen/binary, CipherPayload/binary>> = Unprotected,
-            PacketNumber = binary:decode_unsigned(PNBin, big),
+            TruncatedPN = binary:decode_unsigned(PNBin, big),
+            PacketNumber = reconstruct_pn(TruncatedPN, PNLen, LargestPN),
 
-            %% Header = everything up to and including PN
             HeaderLen = PNOffset + PNLen,
             <<Header:HeaderLen/binary, _/binary>> = Unprotected,
 
-            %% Decrypt
             case decrypt_payload(CipherPayload, Key, IV, PacketNumber, Header) of
                 {ok, PlainPayload} ->
                     {ok, Header, PlainPayload, PacketNumber};
@@ -212,7 +217,7 @@ unprotect_packet(ProtectedPacket, _LargestPN, {Key, IV, HPKey}, IsLong) ->
 %% @doc Full packet unprotection for short header with known DCID length.
 -spec unprotect_packet(binary(), non_neg_integer(), key_set(), boolean(), non_neg_integer()) ->
     {ok, binary(), binary(), non_neg_integer()} | {error, term()}.
-unprotect_packet(ProtectedPacket, _LargestPN, {Key, IV, HPKey}, false = IsLong, DCIDLen) ->
+unprotect_packet(ProtectedPacket, LargestPN, {Key, IV, HPKey}, false = IsLong, DCIDLen) ->
     PNOffset = find_pn_offset(ProtectedPacket, false, DCIDLen),
 
     SampleOffset = PNOffset + 4,
@@ -220,20 +225,55 @@ unprotect_packet(ProtectedPacket, _LargestPN, {Key, IV, HPKey}, false = IsLong, 
         false -> {error, packet_too_short};
         true ->
             <<_:SampleOffset/binary, Sample:16/binary, _/binary>> = ProtectedPacket,
+            <<ProtFirstByte:8, _/binary>> = ProtectedPacket,
             Mask = hp_mask(HPKey, Sample),
+            <<M0:8, _:4/binary>> = Mask,
             Unprotected = apply_header_protection(ProtectedPacket, Mask, IsLong, DCIDLen),
             <<FirstByte:8, _/binary>> = Unprotected,
             PNLen = (FirstByte band 16#03) + 1,
             <<_:PNOffset/binary, PNBin:PNLen/binary, CipherPayload/binary>> = Unprotected,
-            PacketNumber = binary:decode_unsigned(PNBin, big),
+            TruncatedPN = binary:decode_unsigned(PNBin, big),
+            PacketNumber = reconstruct_pn(TruncatedPN, PNLen, LargestPN),
             HeaderLen = PNOffset + PNLen,
             <<Header:HeaderLen/binary, _/binary>> = Unprotected,
             case decrypt_payload(CipherPayload, Key, IV, PacketNumber, Header) of
                 {ok, PlainPayload} ->
                     {ok, Header, PlainPayload, PacketNumber};
-                {error, _} = Error ->
-                    Error
+                {error, _} ->
+                    {error, {decrypt_failed, #{prot_fb => ProtFirstByte,
+                                               mask0 => M0,
+                                               unprot_fb => FirstByte,
+                                               pn_len => PNLen,
+                                               truncated_pn => TruncatedPN,
+                                               reconstructed_pn => PacketNumber,
+                                               largest_pn => LargestPN,
+                                               pn_offset => PNOffset,
+                                               sample_hex => binary:encode_hex(Sample),
+                                               pkt_size => byte_size(ProtectedPacket)}}}
             end
+    end.
+
+%% ===================================================================
+%% Packet Number Reconstruction (RFC 9000, Appendix A)
+%% ===================================================================
+
+-spec reconstruct_pn(non_neg_integer(), 1..4, non_neg_integer()) -> non_neg_integer().
+reconstruct_pn(TruncatedPN, PNLen, LargestPN) ->
+    PNNBits = PNLen * 8,
+    ExpectedPN = LargestPN + 1,
+    PNWin = 1 bsl PNNBits,
+    PNHWin = PNWin div 2,
+    PNMask = PNWin - 1,
+    CandidatePN = (ExpectedPN band (bnot PNMask)) bor TruncatedPN,
+    if
+        CandidatePN =< ExpectedPN - PNHWin andalso
+        CandidatePN < (1 bsl 62) - PNWin ->
+            CandidatePN + PNWin;
+        CandidatePN > ExpectedPN + PNHWin andalso
+        CandidatePN >= PNWin ->
+            CandidatePN - PNWin;
+        true ->
+            CandidatePN
     end.
 
 %% ===================================================================
