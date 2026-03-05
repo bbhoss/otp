@@ -93,7 +93,7 @@ acceptor_loop(Listener) ->
     case gen_quic:accept(Listener) of
         {ok, Conn} ->
             io:format("[chat] New connection: ~p~n", [Conn]),
-            spawn_link(fun() -> connection_handler(Conn, undefined) end),
+            spawn(fun() -> connection_handler(Conn, undefined) end),
             acceptor_loop(Listener);
         {error, Reason} ->
             io:format("[chat] Accept error: ~p~n", [Reason])
@@ -306,14 +306,18 @@ room_manager(Rooms) ->
         {get_or_create, From, Name} ->
             case maps:get(Name, Rooms, undefined) of
                 undefined ->
-                    Pid = spawn_link(fun() -> room_proc(Name, #{}) end),
+                    Pid = spawn(fun() -> room_proc(Name, #{}) end),
+                    monitor(process, Pid),
                     io:format("[chat] Created room ~s (~p)~n", [Name, Pid]),
                     From ! {room_pid, Pid},
                     room_manager(Rooms#{Name => Pid});
                 Pid ->
                     From ! {room_pid, Pid},
                     room_manager(Rooms)
-            end
+            end;
+        {'DOWN', _Ref, process, Pid, _Reason} ->
+            Rooms2 = maps:filter(fun(_N, P) -> P =/= Pid end, Rooms),
+            room_manager(Rooms2)
     end.
 
 %%--------------------------------------------------------------------

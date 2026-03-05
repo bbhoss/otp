@@ -112,7 +112,6 @@
     certfile            :: string() | undefined,
     keyfile             :: string() | undefined,
     %% Idle timeout
-    idle_timer          :: reference() | undefined,
     idle_timeout = 30000 :: non_neg_integer(),
     %% PTO timer
     pto_timer           :: reference() | undefined,
@@ -497,7 +496,8 @@ established({call, From}, {controlling_process, NewOwner}, Data) ->
 
 established(cast, {packet, PacketData, _PeerAddr}, Data) ->
     case process_received_packet(PacketData, Data) of
-        {ok, Data2} -> {keep_state, Data2};
+        {ok, Data2} ->
+            {keep_state, Data2, [idle_timeout_action(Data2)]};
         {error, _} -> {keep_state, Data}
     end;
 
@@ -507,7 +507,8 @@ established(info, {'$socket', Socket, select, _Ref},
         {ok, {_Source, PacketData}} ->
             start_recv(Socket),
             case process_received_packet(PacketData, Data) of
-                {ok, Data2} -> {keep_state, Data2};
+                {ok, Data2} ->
+                    {keep_state, Data2, [idle_timeout_action(Data2)]};
                 {error, _} -> {keep_state, Data}
             end;
         {select, _} ->
@@ -545,9 +546,15 @@ established(info, pto_timeout, Data) ->
     PTOTimer = erlang:send_after(round(PTO), self(), pto_timeout),
     {keep_state, Data2#conn_data{recovery = NewRecovery, pto_timer = PTOTimer}};
 
-established(info, idle_timeout, Data) ->
+established({timeout, idle}, idle_timeout, Data) ->
     Data#conn_data.owner ! {quic_closed, self()},
     {next_state, draining, Data};
+
+established(info, keepalive, Data) ->
+    PingFrame = quic_frame:encode(ping),
+    Data2 = send_app_data(PingFrame, Data),
+    start_keepalive_timer(Data2#conn_data.idle_timeout),
+    {keep_state, Data2};
 
 established(info, Msg, Data) ->
     handle_common_info(Msg, established, Data).
@@ -582,6 +589,9 @@ draining(info, drain_complete, _Data) ->
 draining({call, From}, _, _Data) ->
     {keep_state_and_data, [{reply, From, {error, closed}}]};
 
+draining(cast, _, _Data) ->
+    keep_state_and_data;
+
 draining(info, _, _Data) ->
     keep_state_and_data.
 
@@ -589,11 +599,13 @@ draining(info, _, _Data) ->
 %% Terminate
 %% ===================================================================
 
-terminate(_Reason, _State, #conn_data{udp_socket = Socket}) ->
+terminate(_Reason, _State, #conn_data{role = client, udp_socket = Socket}) ->
     case Socket of
         undefined -> ok;
         _ -> socket:close(Socket)
     end,
+    ok;
+terminate(_Reason, _State, #conn_data{role = server}) ->
     ok.
 
 %% ===================================================================
@@ -1293,6 +1305,12 @@ handshake_drain(Socket, Data) ->
             {keep_state, Data}
     end.
 
+idle_timeout_action(#conn_data{idle_timeout = Timeout}) ->
+    {{timeout, idle}, Timeout, idle_timeout}.
+
+start_keepalive_timer(IdleTimeout) ->
+    erlang:send_after(IdleTimeout div 2, self(), keepalive).
+
 maybe_transition_to_established(Data) ->
     %% Check if handshake is fully complete (app keys + TLS handshake done)
     case {Data#conn_data.app_keys, Data#conn_data.handshake_done} of
@@ -1301,15 +1319,14 @@ maybe_transition_to_established(Data) ->
         {_, false} ->
             {keep_state, Data};
         {_, true} ->
-            %% Start idle timer
-            IdleTimer = erlang:send_after(Data#conn_data.idle_timeout,
-                                          self(), idle_timeout),
             %% Notify waiting callers
             lists:foreach(fun({From, _}) ->
                 gen_statem:reply(From, {ok, self()})
             end, Data#conn_data.conn_waiters),
+            start_keepalive_timer(Data#conn_data.idle_timeout),
             {next_state, established,
-             Data#conn_data{idle_timer = IdleTimer, conn_waiters = []}}
+             Data#conn_data{conn_waiters = []},
+             [idle_timeout_action(Data)]}
     end.
 
 build_local_params(Opts, SCID) ->

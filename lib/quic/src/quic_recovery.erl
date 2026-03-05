@@ -172,7 +172,7 @@ update_rtt(LatestRTT, AckDelay, #recovery{min_rtt = MinRTT} = R) ->
 detect_lost_packets(LargestAcked, _PNSpace, Recovery) ->
     %% Time threshold
     MaxRTT = max(Recovery#recovery.smoothed_rtt, Recovery#recovery.latest_rtt),
-    TimeThreshold = max(MaxRTT * ?TIME_THRESHOLD_NUM div ?TIME_THRESHOLD_DEN,
+    TimeThreshold = max(round(MaxRTT * ?TIME_THRESHOLD_NUM / ?TIME_THRESHOLD_DEN),
                         ?TIMER_GRANULARITY),
 
     Now = erlang:monotonic_time(millisecond),
