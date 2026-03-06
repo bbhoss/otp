@@ -37,7 +37,11 @@
     get_loss_timeout/1,
     detect_lost_packets/3,
     on_congestion_event/2,
-    set_max_ack_delay/2
+    set_max_ack_delay/2,
+    set_loss_detection_timer/1,
+    on_loss_detection_timeout/1,
+    on_pn_space_discarded/2,
+    in_persistent_congestion/2
 ]).
 
 -define(PACKET_THRESHOLD, 3).
@@ -46,6 +50,7 @@
 -define(INITIAL_RTT, 333).
 -define(TIMER_GRANULARITY, 1).
 -define(MAX_PTO, 60000).
+-define(PERSISTENT_CONGESTION_THRESHOLD, 3).
 
 %% ===================================================================
 %% Initialization
@@ -343,3 +348,162 @@ get_loss_timeout(#recovery{loss_time = LossTimeMap}) ->
 -spec set_max_ack_delay(non_neg_integer(), #recovery{}) -> #recovery{}.
 set_max_ack_delay(MaxAckDelay, Recovery) ->
     Recovery#recovery{max_ack_delay = MaxAckDelay}.
+
+%% ===================================================================
+%% Loss Detection Timer (RFC 9002, Appendix A.8)
+%% ===================================================================
+
+%% @doc Compute when the loss detection timer should fire.
+%% Returns {Time, Space} where Time is an absolute monotonic ms timestamp,
+%% or {infinity, undefined} if no timer needed.
+-spec set_loss_detection_timer(#recovery{}) ->
+    {number() | infinity, atom() | undefined}.
+set_loss_detection_timer(Recovery) ->
+    %% First check loss_time across all spaces (A.8: earliest loss time)
+    case get_loss_time_and_space(Recovery) of
+        {LossTime, Space} when LossTime =/= undefined ->
+            {LossTime, Space};
+        _ ->
+            %% No loss time set — check if there are any in-flight packets
+            HasInFlight = has_ack_eliciting_in_flight(Recovery),
+            case HasInFlight of
+                false ->
+                    {infinity, undefined};
+                true ->
+                    %% Use PTO (A.8)
+                    {PTOTime, PTOSpace} = get_pto_time_and_space(Recovery),
+                    {PTOTime, PTOSpace}
+            end
+    end.
+
+%% @doc Handle loss detection timeout (RFC 9002, Appendix A.9).
+%% Returns {action, Space, Recovery} where action is:
+%%   detect_lost — run loss detection for the space
+%%   send_probe — send 1-2 probe packets in the space
+-spec on_loss_detection_timeout(#recovery{}) ->
+    {detect_lost, atom(), #recovery{}} | {send_probe, atom(), #recovery{}}.
+on_loss_detection_timeout(Recovery) ->
+    case get_loss_time_and_space(Recovery) of
+        {LossTime, Space} when LossTime =/= undefined ->
+            %% Time threshold loss (A.9)
+            {detect_lost, Space, Recovery};
+        _ ->
+            %% PTO timeout — send probe packets (A.9)
+            {_PTOTime, PTOSpace} = get_pto_time_and_space(Recovery),
+            NewRecovery = Recovery#recovery{
+                pto_count = Recovery#recovery.pto_count + 1
+            },
+            {send_probe, PTOSpace, NewRecovery}
+    end.
+
+%% ===================================================================
+%% Packet Number Space Discard (RFC 9002, Appendix A.11)
+%% ===================================================================
+
+%% @doc Called when Initial or Handshake keys are discarded.
+%% Removes bytes_in_flight for all packets in the space and resets state.
+-spec on_pn_space_discarded(atom(), #recovery{}) -> #recovery{}.
+on_pn_space_discarded(PNSpace, Recovery) ->
+    SpaceMap = maps:get(PNSpace, Recovery#recovery.sent_packets),
+    %% Sum bytes_in_flight for all in-flight packets in this space
+    DroppedBytes = maps:fold(
+        fun(_PN, #{in_flight := true, sent_bytes := SB}, Acc) -> Acc + SB;
+           (_PN, _, Acc) -> Acc
+        end, 0, SpaceMap),
+    NewSentPackets = maps:put(PNSpace, #{}, Recovery#recovery.sent_packets),
+    NewLossTime = maps:put(PNSpace, undefined, Recovery#recovery.loss_time),
+    NewBIF = max(0, Recovery#recovery.bytes_in_flight - DroppedBytes),
+    Recovery#recovery{
+        sent_packets = NewSentPackets,
+        bytes_in_flight = NewBIF,
+        loss_time = NewLossTime
+    }.
+
+%% ===================================================================
+%% Persistent Congestion (RFC 9002, Section 7.6)
+%% ===================================================================
+
+%% @doc Check if a set of lost packets indicates persistent congestion.
+%% LostPackets is a list of #{time_sent := integer()} maps.
+-spec in_persistent_congestion([map()], #recovery{}) -> boolean().
+in_persistent_congestion([], _Recovery) ->
+    false;
+in_persistent_congestion(LostPackets, Recovery) ->
+    SRTT = Recovery#recovery.smoothed_rtt,
+    RTTVar = Recovery#recovery.rttvar,
+    MAD = Recovery#recovery.max_ack_delay,
+    %% RFC 9002 §7.6.2: congestion_period = smoothed_rtt + max(4*rttvar, granularity) + max_ack_delay
+    CongestionPeriod = (SRTT + max(4 * RTTVar, ?TIMER_GRANULARITY) + MAD)
+                       * ?PERSISTENT_CONGESTION_THRESHOLD,
+    %% Check if any two consecutive lost packets span longer than congestion_period
+    SortedTimes = lists:sort([T || #{time_sent := T} <- LostPackets]),
+    case {lists:min(SortedTimes), lists:max(SortedTimes)} of
+        {Earliest, Latest} when Latest - Earliest > CongestionPeriod ->
+            true;
+        _ ->
+            false
+    end.
+
+%% ===================================================================
+%% Internal Helpers
+%% ===================================================================
+
+get_loss_time_and_space(#recovery{loss_time = LTMap}) ->
+    %% Find the earliest non-undefined loss time across all spaces
+    maps:fold(
+        fun(Space, Time, {BestTime, _BestSpace}) when
+              Time =/= undefined, (BestTime =:= undefined orelse Time < BestTime) ->
+                {Time, Space};
+           (_Space, _Time, Acc) ->
+                Acc
+        end,
+        {undefined, undefined},
+        LTMap
+    ).
+
+get_pto_time_and_space(Recovery) ->
+    %% Find the space with earliest PTO expiry among spaces with in-flight data
+    Spaces = [initial, handshake, application],
+    lists:foldl(
+        fun(Space, {BestTime, BestSpace}) ->
+            SpaceMap = maps:get(Space, Recovery#recovery.sent_packets),
+            case has_ack_eliciting_in_space(SpaceMap) of
+                false ->
+                    {BestTime, BestSpace};
+                true ->
+                    %% Find the earliest sent time in this space
+                    EarliestSent = maps:fold(
+                        fun(_PN, #{time_sent := TS, ack_eliciting := true}, Min) ->
+                                case Min of undefined -> TS; _ -> min(TS, Min) end;
+                           (_PN, _, Min) -> Min
+                        end, undefined, SpaceMap),
+                    case EarliestSent of
+                        undefined ->
+                            {BestTime, BestSpace};
+                        _ ->
+                            PTO = get_pto(Recovery, Space),
+                            PTOTime = EarliestSent + round(PTO),
+                            case BestTime =:= infinity orelse PTOTime < BestTime of
+                                true -> {PTOTime, Space};
+                                false -> {BestTime, BestSpace}
+                            end
+                    end
+            end
+        end,
+        {infinity, application},
+        Spaces
+    ).
+
+has_ack_eliciting_in_flight(#recovery{sent_packets = SentPackets}) ->
+    maps:fold(
+        fun(_Space, _SpaceMap, true) ->
+                true;
+           (_Space, SpaceMap, false) ->
+                has_ack_eliciting_in_space(SpaceMap)
+        end, false, SentPackets).
+
+has_ack_eliciting_in_space(SpaceMap) ->
+    maps:fold(
+        fun(_PN, #{ack_eliciting := true, in_flight := true}, _) -> true;
+           (_PN, _, Acc) -> Acc
+        end, false, SpaceMap).

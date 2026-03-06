@@ -122,24 +122,33 @@ receive_data(#quic_stream{recv_state = RS} = _Stream, _Data, _Offset, _Fin)
   when RS =:= data_read; RS =:= reset_recvd ->
     {error, stream_closed};
 receive_data(#quic_stream{} = Stream, Data, Offset, Fin) ->
-    %% Store data in the receive buffer keyed by offset
-    RecvBuf = Stream#quic_stream.recv_buffer,
-    NewRecvBuf = case byte_size(Data) > 0 of
-        true -> RecvBuf#{Offset => Data};
-        false -> RecvBuf
-    end,
-    NewRecvDataSize = Stream#quic_stream.recv_data_size + byte_size(Data),
+    DataLen = byte_size(Data),
+    EndOffset = Offset + DataLen,
+    MaxRecv = Stream#quic_stream.max_recv_data,
+    %% RFC 9000 §4.1: Check stream-level flow control
+    case MaxRecv > 0 andalso EndOffset > MaxRecv of
+        true ->
+            {error, {flow_control_error, Stream#quic_stream.id}};
+        false ->
+            %% Store data in the receive buffer keyed by offset
+            RecvBuf = Stream#quic_stream.recv_buffer,
+            NewRecvBuf = case DataLen > 0 of
+                true -> RecvBuf#{Offset => Data};
+                false -> RecvBuf
+            end,
+            NewRecvDataSize = Stream#quic_stream.recv_data_size + DataLen,
 
-    NewStream = Stream#quic_stream{
-        recv_buffer = NewRecvBuf,
-        recv_data_size = NewRecvDataSize,
-        fin_received = Fin orelse Stream#quic_stream.fin_received,
-        recv_state = case Fin of
-            true -> size_known;
-            false -> Stream#quic_stream.recv_state
-        end
-    },
-    {ok, NewStream}.
+            NewStream = Stream#quic_stream{
+                recv_buffer = NewRecvBuf,
+                recv_data_size = NewRecvDataSize,
+                fin_received = Fin orelse Stream#quic_stream.fin_received,
+                recv_state = case Fin of
+                    true -> size_known;
+                    false -> Stream#quic_stream.recv_state
+                end
+            },
+            {ok, NewStream}
+    end.
 
 %% @doc Read contiguous data from the receive buffer.
 %% Returns as much contiguous data as available starting from recv_offset.

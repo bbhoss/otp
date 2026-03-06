@@ -119,7 +119,8 @@
     address_validated = false :: boolean(),
     sent_with_current_key = false :: boolean(),
     acked_with_current_key = false :: boolean(),
-    coalesce_buffer = <<>> :: binary()
+    coalesce_buffer = <<>> :: binary(),
+    loss_detection_tref     :: reference() | undefined
 }).
 
 %% ===================================================================
@@ -267,9 +268,7 @@ idle({call, From}, {connect, Host, Port}, Data) ->
             },
 
             {ok, Data3} = drain_loop(Socket, Data2),
-            PTO = quic_recovery:get_pto(Data3#conn_data.recovery),
-            {next_state, handshake, Data3,
-             [{{timeout, pto}, round(PTO), pto_timeout}]};
+            {next_state, handshake, reset_loss_detection_timer(Data3)};
         {error, Reason} ->
             {keep_state_and_data, [{reply, From, {error, Reason}}]}
     end;
@@ -310,13 +309,20 @@ handshake(info, {'$socket', Socket, _, _} = Msg, #conn_data{udp_socket = Socket}
         abort -> {stop, normal}
     end;
 
-handshake({timeout, pto}, pto_timeout, Data) ->
-    NewRecovery = Data#conn_data.recovery#recovery{
-        pto_count = Data#conn_data.recovery#recovery.pto_count + 1
-    },
-    PTO = quic_recovery:get_pto(NewRecovery, handshake),
-    {keep_state, Data#conn_data{recovery = NewRecovery},
-     [{{timeout, pto}, round(PTO), pto_timeout}]};
+handshake(info, {timeout, TRef, loss_detection_timeout},
+          #conn_data{loss_detection_tref = TRef} = Data) ->
+    Recovery = Data#conn_data.recovery,
+    case quic_recovery:on_loss_detection_timeout(Recovery) of
+        {detect_lost, Space, Recovery1} ->
+            LargestAcked = get_largest_acked(Space, Data),
+            {_LostPNs, Recovery2} = quic_recovery:detect_lost_packets(
+                LargestAcked, Space, Recovery1),
+            Data2 = Data#conn_data{recovery = Recovery2},
+            {keep_state, reset_loss_detection_timer(Data2)};
+        {send_probe, _Space, Recovery1} ->
+            Data2 = Data#conn_data{recovery = Recovery1},
+            {keep_state, reset_loss_detection_timer(Data2)}
+    end;
 
 handshake({call, From}, {send, _StreamId, _Data}, _Data2) ->
     {keep_state_and_data, [{reply, From, {error, not_established}}]};
@@ -416,6 +422,12 @@ established({call, From}, {send, StreamId, SendData}, Data) ->
                             },
                             Data3 = send_stream_frames(Frames, Data2),
                             {keep_state, Data3, [{reply, From, ok}]};
+                        {error, flow_control_blocked} ->
+                            %% RFC 9000 §4.1: Send STREAM_DATA_BLOCKED to peer
+                            SDBFrame = quic_frame:encode(
+                                {stream_data_blocked, StreamId, Stream#quic_stream.max_send_data}),
+                            Data2 = send_app_data(SDBFrame, Data),
+                            {keep_state, Data2, [{reply, From, {error, flow_control_blocked}}]};
                         {error, _} = Error ->
                             {keep_state_and_data, [{reply, From, Error}]}
                     end
@@ -514,19 +526,28 @@ established(info, {'$socket', Socket, _, _} = Msg,
         abort -> {stop, normal}
     end;
 
-established({timeout, pto}, pto_timeout, Data) ->
-    case Data#conn_data.recovery#recovery.bytes_in_flight > 0 of
-        true ->
+established(info, {timeout, TRef, loss_detection_timeout},
+            #conn_data{loss_detection_tref = TRef} = Data) ->
+    Recovery = Data#conn_data.recovery,
+    case quic_recovery:on_loss_detection_timeout(Recovery) of
+        {detect_lost, Space, Recovery1} ->
+            %% Time threshold expired — detect and retransmit lost packets
+            LargestAcked = get_largest_acked(Space, Data),
+            {LostPNs, Recovery2} = quic_recovery:detect_lost_packets(
+                LargestAcked, Space, Recovery1),
+            Recovery3 = maybe_persistent_congestion(LostPNs, Space, Data, Recovery2),
+            Data2 = Data#conn_data{recovery = Recovery3},
+            Data3 = retransmit_lost_frames(LostPNs, Space, Data2),
+            {keep_state, reset_loss_detection_timer(Data3)};
+        {send_probe, Space, Recovery1} ->
+            %% PTO expired — send probe (ping)
+            Data2 = Data#conn_data{recovery = Recovery1},
             PingFrame = quic_frame:encode(ping),
-            Data2 = send_app_data(PingFrame, Data),
-            NewRecovery = Data2#conn_data.recovery#recovery{
-                pto_count = Data2#conn_data.recovery#recovery.pto_count + 1
-            },
-            PTO = quic_recovery:get_pto(NewRecovery),
-            {keep_state, Data2#conn_data{recovery = NewRecovery},
-             [{{timeout, pto}, round(PTO), pto_timeout}]};
-        false ->
-            {keep_state, Data}
+            Data3 = case Space of
+                application -> send_app_data(PingFrame, Data2);
+                _ -> send_app_data(PingFrame, Data2)
+            end,
+            {keep_state, reset_loss_detection_timer(Data3)}
     end;
 
 established({timeout, idle}, idle_timeout, Data) ->
@@ -1108,9 +1129,13 @@ process_frame({connection_close_app, _ErrorCode, _Reason}, _Level, Data) ->
     {transition_to_draining, Data};
 
 process_frame(handshake_done, _Level, Data) ->
+    %% RFC 9001 §4.9.2: Discard handshake keys when handshake confirmed
+    %% RFC 9002 A.11: Remove handshake packets from bytes_in_flight
+    NewRecovery = quic_recovery:on_pn_space_discarded(handshake, Data#conn_data.recovery),
     {ok, Data#conn_data{
         handshake_confirmed = true,
-        handshake_keys = undefined
+        handshake_keys = undefined,
+        recovery = NewRecovery
     }};
 
 process_frame({datagram, DGData}, _Level, Data) ->
@@ -1198,6 +1223,14 @@ process_tls_action({application_keys, Keys}, Data) ->
     Data#conn_data{app_keys = Keys};
 
 process_tls_action({handshake_complete, _ALPN, RemoteParams}, Data) ->
+    %% RFC 9000 §18: Validate remote transport parameters
+    PeerRole = case Data#conn_data.role of client -> server; server -> client end,
+    case quic_transport_params:validate(RemoteParams, PeerRole) of
+        ok -> ok;
+        {error, Reason} ->
+            io:format("[conn:~p] transport param validation failed: ~p~n",
+                      [self(), Reason])
+    end,
     Data#conn_data{
         handshake_done = true,
         initial_keys = undefined,
@@ -1219,10 +1252,13 @@ process_tls_action({handshake_complete, _ALPN, RemoteParams}, Data) ->
 process_tls_action(send_handshake_done, Data) ->
     HDFrame = quic_frame:encode(handshake_done),
     Data2 = send_app_data(HDFrame, Data),
+    %% RFC 9002 A.11: Discard handshake PN space when keys dropped
+    NewRecovery = quic_recovery:on_pn_space_discarded(handshake, Data2#conn_data.recovery),
     Data2#conn_data{
         handshake_confirmed = true,
         handshake_keys = undefined,
-        address_validated = true
+        address_validated = true,
+        recovery = NewRecovery
     };
 
 process_tls_action(_, Data) ->
@@ -1562,7 +1598,26 @@ process_drain_packet(PacketData, Data) ->
             {ok, Data3};
         {transition_to_draining, Data2} ->
             {draining, Data2};
+        {error, {flow_control_error, _}} ->
+            %% RFC 9000 §4.1: Send FLOW_CONTROL_ERROR and close
+            CloseFrame = quic_frame:encode(
+                {connection_close, ?QUIC_FLOW_CONTROL_ERROR, 0, <<>>}),
+            Data2 = send_app_data(CloseFrame, Data),
+            {draining, Data2};
+        {error, {final_size_error, _}} ->
+            CloseFrame = quic_frame:encode(
+                {connection_close, ?QUIC_FINAL_SIZE_ERROR, 0, <<>>}),
+            Data2 = send_app_data(CloseFrame, Data),
+            {draining, Data2};
+        {error, {tls_error, AlertCode}} ->
+            %% RFC 9001 §4.8: Map TLS alerts to CRYPTO_ERROR
+            ErrorCode = ?QUIC_CRYPTO_ERROR_BASE + AlertCode,
+            CloseFrame = quic_frame:encode(
+                {connection_close, ErrorCode, 16#06, <<>>}),
+            Data2 = send_app_data(CloseFrame, Data),
+            {draining, Data2};
         {error, _Reason} ->
+            %% Non-fatal: silently ignore (e.g., decrypt failure for unknown keys)
             {ok, Data}
     end.
 
@@ -1610,22 +1665,45 @@ get_or_create_stream(StreamId, Data) ->
                 #transport_params{initial_max_stream_data_bidi_local = V} -> V;
                 _ -> 65536
             end,
+            %% RFC 9000 §2.1: Create all intervening streams of the same type
+            Data1 = create_intervening_streams(StreamId, MaxSend, MaxRecv, Data),
             Stream = quic_stream:new(StreamId, MaxSend, MaxRecv),
-            Streams = maps:put(StreamId, Stream, Data#conn_data.streams),
+            Streams = maps:put(StreamId, Stream, Data1#conn_data.streams),
 
-            Data2 = case Data#conn_data.stream_acceptors of
+            Data2 = case Data1#conn_data.stream_acceptors of
                 [{From, _} | Rest] ->
                     StreamRef = {quic_stream, self(), StreamId},
                     gen_statem:reply(From, {ok, StreamRef}),
-                    Data#conn_data{streams = Streams, stream_acceptors = Rest};
+                    Data1#conn_data{streams = Streams, stream_acceptors = Rest};
                 [] ->
-                    Data#conn_data{
+                    Data1#conn_data{
                         streams = Streams,
-                        pending_streams = Data#conn_data.pending_streams ++ [StreamId]
+                        pending_streams = Data1#conn_data.pending_streams ++ [StreamId]
                     }
             end,
             {Stream, Data2}
     end.
+
+create_intervening_streams(StreamId, MaxSend, MaxRecv, Data) ->
+    %% Stream IDs increment by 4 within the same type
+    %% Create all lower-numbered peer-initiated streams of the same type
+    Type = StreamId band 3,
+    create_intervening_streams_loop(Type, StreamId - 4, MaxSend, MaxRecv, Data).
+
+create_intervening_streams_loop(_Type, Id, _MaxSend, _MaxRecv, Data) when Id < 0 ->
+    Data;
+create_intervening_streams_loop(Type, Id, MaxSend, MaxRecv, Data) when Id band 3 =:= Type ->
+    case maps:is_key(Id, Data#conn_data.streams) of
+        true ->
+            Data;
+        false ->
+            Stream = quic_stream:new(Id, MaxSend, MaxRecv),
+            Streams = maps:put(Id, Stream, Data#conn_data.streams),
+            create_intervening_streams_loop(Type, Id - 4, MaxSend, MaxRecv,
+                                            Data#conn_data{streams = Streams})
+    end;
+create_intervening_streams_loop(_Type, _Id, _MaxSend, _MaxRecv, Data) ->
+    Data.
 
 allocate_stream_id(bidirectional, Data) ->
     Id = Data#conn_data.next_bidi_stream,
@@ -1692,10 +1770,18 @@ maybe_transition_to_established(Data) ->
             lists:foreach(fun({From, _}) ->
                 gen_statem:reply(From, {ok, self()})
             end, Data#conn_data.conn_waiters),
-            Data2 = Data#conn_data{conn_waiters = []},
-            {next_state, established, Data2,
-             [idle_timeout_action(Data2),
-              keepalive_action(Data2#conn_data.idle_timeout)]}
+            %% RFC 9001 §4.9.1: Discard initial keys
+            Recovery1 = quic_recovery:on_pn_space_discarded(
+                initial, Data#conn_data.recovery),
+            Data2 = Data#conn_data{
+                conn_waiters = [],
+                initial_keys = undefined,
+                recovery = Recovery1
+            },
+            Data3 = reset_loss_detection_timer(Data2),
+            {next_state, established, Data3,
+             [idle_timeout_action(Data3),
+              keepalive_action(Data3#conn_data.idle_timeout)]}
     end.
 
 build_local_params(Opts, SCID) ->
@@ -1789,6 +1875,62 @@ maybe_send_max_stream_data(StreamId, Stream, Data) ->
         false ->
             Data
     end.
+
+%% ===================================================================
+%% Loss Detection Timer (RFC 9002)
+%% ===================================================================
+
+reset_loss_detection_timer(Data) ->
+    %% Cancel any existing timer
+    case Data#conn_data.loss_detection_tref of
+        undefined -> ok;
+        OldTRef -> erlang:cancel_timer(OldTRef)
+    end,
+    {Time, _Space} = quic_recovery:set_loss_detection_timer(Data#conn_data.recovery),
+    case Time of
+        infinity ->
+            Data#conn_data{loss_detection_tref = undefined};
+        _ ->
+            Now = erlang:monotonic_time(millisecond),
+            Delay = max(1, round(Time - Now)),
+            TRef = erlang:start_timer(Delay, self(), loss_detection_timeout),
+            Data#conn_data{loss_detection_tref = TRef}
+    end.
+
+get_largest_acked(PNSpace, Data) ->
+    PN = maps:get(PNSpace, Data#conn_data.pn_spaces),
+    case PN#pn_space.received_pns of
+        [] -> 0;
+        PNs -> lists:max(PNs)
+    end.
+
+maybe_persistent_congestion(LostPNs, PNSpace, _Data, Recovery) ->
+    SpaceMap = maps:get(PNSpace, Recovery#recovery.sent_packets),
+    LostInfos = lists:filtermap(
+        fun(PN) ->
+            case maps:find(PN, SpaceMap) of
+                {ok, Info} -> {true, Info};
+                error -> false
+            end
+        end, LostPNs),
+    case quic_recovery:in_persistent_congestion(LostInfos, Recovery) of
+        true ->
+            %% RFC 9002 §7.6.2: Reset cwnd to minimum window
+            MDS = Recovery#recovery.max_datagram_size,
+            Recovery#recovery{
+                congestion_window = ?MINIMUM_WINDOW_PACKETS * MDS,
+                bytes_in_flight = max(0, Recovery#recovery.bytes_in_flight)
+            };
+        false ->
+            Recovery
+    end.
+
+retransmit_lost_frames(_LostPNs, _Space, Data) ->
+    %% For now, lost packets that need retransmission are handled
+    %% by the application layer via stream retransmission.
+    %% CRYPTO frames would need to be retransmitted here.
+    %% TODO: implement per-frame retransmission tracking
+    Data.
 
 handle_common_info({'DOWN', _MonRef, process, Owner, _Reason},
                    _State, #conn_data{owner = Owner} = Data) ->

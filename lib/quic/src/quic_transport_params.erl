@@ -30,7 +30,7 @@
 
 -include("quic.hrl").
 
--export([encode/1, decode/1, default_client/0, default_server/1]).
+-export([encode/1, decode/1, validate/2, default_client/0, default_server/1]).
 
 %% @doc Encode transport parameters to binary for TLS extension.
 -spec encode(#transport_params{}) -> binary().
@@ -211,3 +211,36 @@ set_param(?TP_GREASE_QUIC_BIT, <<>>, P) ->
 set_param(_Unknown, _V, P) ->
     %% Unknown parameters MUST be ignored (RFC 9000, Section 18)
     P.
+
+%% @doc Validate remote transport parameters (RFC 9000 §18).
+%% PeerRole is the role of the peer (client or server).
+-spec validate(#transport_params{}, client | server) -> ok | {error, term()}.
+validate(#transport_params{} = P, PeerRole) ->
+    Checks = [
+        %% RFC 9000 §18.2: max_streams MUST NOT exceed 2^60
+        {P#transport_params.initial_max_streams_bidi =< (1 bsl 60),
+         {transport_parameter_error, max_streams_too_large}},
+        {P#transport_params.initial_max_streams_uni =< (1 bsl 60),
+         {transport_parameter_error, max_streams_too_large}},
+        %% RFC 9000 §18.2: ack_delay_exponent MUST NOT exceed 20
+        {P#transport_params.ack_delay_exponent =< 20,
+         {transport_parameter_error, ack_delay_exponent_too_large}},
+        %% RFC 9000 §18.2: max_ack_delay MUST be less than 2^14
+        {P#transport_params.max_ack_delay < (1 bsl 14),
+         {transport_parameter_error, max_ack_delay_too_large}},
+        %% RFC 9000 §18.2: active_connection_id_limit MUST be at least 2
+        {P#transport_params.active_connection_id_limit >= 2,
+         {transport_parameter_error, active_cid_limit_too_small}},
+        %% RFC 9000 §18.2: Clients MUST NOT send original_destination_connection_id
+        {not (PeerRole =:= client andalso
+              P#transport_params.original_destination_connection_id =/= undefined),
+         {transport_parameter_error, client_sent_odcid}},
+        %% RFC 9000 §18.2: Clients MUST NOT send stateless_reset_token
+        {not (PeerRole =:= client andalso
+              P#transport_params.stateless_reset_token =/= undefined),
+         {transport_parameter_error, client_sent_stateless_reset_token}}
+    ],
+    case lists:dropwhile(fun({true, _}) -> true; (_) -> false end, Checks) of
+        [] -> ok;
+        [{false, Error} | _] -> {error, Error}
+    end.
