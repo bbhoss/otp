@@ -572,6 +572,9 @@ closing(state_timeout, drain_complete, _Data) ->
 closing({call, From}, _, _Data) ->
     {keep_state_and_data, [{reply, From, {error, closing}}]};
 
+closing({timeout, _}, _, _Data) ->
+    keep_state_and_data;
+
 closing(info, _Msg, _Data) ->
     keep_state_and_data.
 
@@ -584,6 +587,9 @@ draining(state_timeout, drain_complete, _Data) ->
 
 draining({call, From}, _, _Data) ->
     {keep_state_and_data, [{reply, From, {error, closed}}]};
+
+draining({timeout, _}, _, _Data) ->
+    keep_state_and_data;
 
 draining(info, _, _Data) ->
     keep_state_and_data.
