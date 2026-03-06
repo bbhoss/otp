@@ -20,11 +20,13 @@
 %% %CopyrightEnd%
 %%
 
-%% QUIC Listener (Server-side UDP packet demuxer)
+%% QUIC Listener
 %%
-%% Binds a UDP socket and demultiplexes incoming packets to connection
-%% processes based on the Destination Connection ID. New Initial packets
-%% create new connections through the connection supervisor.
+%% Binds an unconnected UDP socket and watches for new Initial packets.
+%% For each new peer, creates a connected UDP socket on the same port
+%% and hands it to a fresh connection process. The kernel routes all
+%% subsequent packets from that peer directly to the connected socket,
+%% so the listener only ever sees traffic from unknown peers.
 
 -module(quic_listener).
 
@@ -51,14 +53,8 @@
     socket          :: term(),
     port            :: inet:port_number(),
     options         :: list(),
-    %% Connection ID -> Connection Pid mapping
-    connections = #{} :: #{binary() => pid()},
-    %% Queue of processes waiting for new connections
-    acceptors = []    :: [{gen_statem:from(), reference()}],
-    %% Pending connections not yet accepted
-    pending = []      :: [pid()],
-    %% Monitor refs
-    conn_monitors = #{} :: #{reference() => binary()}
+    acceptors = []  :: [{gen_statem:from(), reference()}],
+    pending = []    :: [pid()]
 }).
 
 %% ===================================================================
@@ -86,9 +82,10 @@ callback_mode() -> state_functions.
 init({Port, Opts}) ->
     case socket:open(inet, dgram, udp) of
         {ok, Socket} ->
+            ok = socket:setopt(Socket, {socket, reuseaddr}, true),
+            ok = socket:setopt(Socket, {socket, reuseport}, true),
             case socket:bind(Socket, #{family => inet, addr => any, port => Port}) of
                 ok ->
-                    %% Start receiving
                     socket:recvfrom(Socket, 0, [], nowait),
                     {ok, listening, #listener_data{
                         socket = Socket,
@@ -121,23 +118,9 @@ listening(info, {'$socket', Socket, select, _Ref},
           #listener_data{socket = Socket} = Data) ->
     drain_socket(Socket, Data);
 
-listening(info, {'DOWN', MonRef, process, _Pid, _Reason}, Data) ->
-    %% Connection process died - remove from routing table
-    case maps:take(MonRef, Data#listener_data.conn_monitors) of
-        {DCID, NewMonitors} ->
-            NewConns = maps:remove(DCID, Data#listener_data.connections),
-            {keep_state, Data#listener_data{
-                connections = NewConns,
-                conn_monitors = NewMonitors
-            }};
-        error ->
-            {keep_state, Data}
-    end;
-
-listening(info, {register_scid, SCID, ConnPid}, Data) ->
-    %% Connection process registering its SCID for routing
-    NewConns = maps:put(SCID, ConnPid, Data#listener_data.connections),
-    {keep_state, Data#listener_data{connections = NewConns}};
+listening(info, {'DOWN', _MonRef, process, Pid, _Reason}, Data) ->
+    quic_registry:release(Pid),
+    {keep_state, Data};
 
 listening(info, Msg, _Data) ->
     io:format("[listener] unexpected info: ~p~n", [Msg]),
@@ -163,99 +146,47 @@ terminate(_Reason, _State, #listener_data{socket = Socket}) ->
 %% Internal
 %% ===================================================================
 
-handle_incoming_packet(PacketData, Source, Data) ->
-    case PacketData of
-        <<1:1, _:7, _/binary>> ->
-            %% Long header - extract DCID
-            case extract_dcid(PacketData) of
-                {ok, DCID} ->
-                    case maps:find(DCID, Data#listener_data.connections) of
-                        {ok, ConnPid} ->
-                            %% Route to existing connection
-                            quic_connection:handle_packet(ConnPid, {PacketData, Source}),
-                            Data;
-                        error ->
-                            %% Check if this is an Initial packet
-                            <<_FB:8, _Version:32, _/binary>> = PacketData,
-                            <<FB:8, _/binary>> = PacketData,
-                            Type = (FB band 16#30) bsr 4,
-                            case Type of
-                                ?INITIAL_PACKET ->
-                                    create_new_connection(PacketData, Source, DCID, Data);
-                                _ ->
-                                    Data
-                            end
-                    end;
-                {error, _} ->
-                    Data
-            end;
-        <<0:1, _:7, _/binary>> ->
-            %% Short header - need to try known DCID lengths
-            %% For simplicity, try 8-byte DCID (our default)
-            case byte_size(PacketData) > 9 of
+handle_incoming_packet(<<1:1, _:7, _/binary>> = PacketData, Source, Data) ->
+    <<FB:8, _/binary>> = PacketData,
+    Type = (FB band 16#30) bsr 4,
+    case Type of
+        ?INITIAL_PACKET ->
+            create_new_connection(PacketData, Source, Data);
+        _ ->
+            Data
+    end;
+handle_incoming_packet(_PacketData, _Source, Data) ->
+    Data.
+
+create_new_connection(PacketData, PeerAddr, Data) ->
+    #listener_data{socket = ListenSocket, options = Opts} = Data,
+    Args = #{role => server, owner => self(), options => Opts},
+    case quic_connection_sup:start_connection(Args) of
+        {ok, ConnPid} ->
+            case quic_registry:claim(PeerAddr, ConnPid) of
                 true ->
-                    <<_:1/binary, DCID:8/binary, _/binary>> = PacketData,
-                    case maps:find(DCID, Data#listener_data.connections) of
-                        {ok, ConnPid} ->
-                            quic_connection:handle_packet(ConnPid, {PacketData, Source}),
-                            Data;
-                        error ->
-                            Data
+                    monitor(process, ConnPid),
+                    {ok, LocalAddr} = socket:sockname(ListenSocket),
+                    case quic_connection:accept_init(ConnPid, LocalAddr,
+                                                      PeerAddr, PacketData) of
+                        {ok, _SCID} ->
+                            ok;
+                        {error, Reason} ->
+                            io:format("[listener] accept_init failed: ~p~n", [Reason])
+                    end,
+                    case Data#listener_data.acceptors of
+                        [{From, _} | RestAcceptors] ->
+                            gen_statem:reply(From, {ok, ConnPid}),
+                            Data#listener_data{acceptors = RestAcceptors};
+                        [] ->
+                            Data#listener_data{
+                                pending = Data#listener_data.pending ++ [ConnPid]
+                            }
                     end;
                 false ->
                     Data
             end;
-        _ ->
+        {error, Reason} ->
+            io:format("[listener] start_connection failed: ~p~n", [Reason]),
             Data
     end.
-
-create_new_connection(PacketData, Source, DCID, Data) ->
-    %% Start a new connection process
-    Opts = Data#listener_data.options,
-    Args = #{role => server, owner => self(), options => Opts},
-    case quic_connection_sup:start_connection(Args) of
-        {ok, ConnPid} ->
-            %% Register the connection
-            MonRef = erlang:monitor(process, ConnPid),
-            NewConns = maps:put(DCID, ConnPid, Data#listener_data.connections),
-            NewMonitors = maps:put(MonRef, DCID, Data#listener_data.conn_monitors),
-
-            %% Also register the server's SCID for future routing
-            %% The connection will tell us its SCID later
-
-            %% Initialize the connection with the Initial packet
-            case quic_connection:accept_init(ConnPid, Data#listener_data.socket,
-                                              Source, PacketData) of
-                {ok, SCID} ->
-                    %% Register SCID for routing future packets
-                    NewConns2 = maps:put(SCID, ConnPid, NewConns),
-                    ok;
-                {error, _} ->
-                    NewConns2 = NewConns,
-                    ok
-            end,
-
-            %% Deliver to acceptor or queue
-            case Data#listener_data.acceptors of
-                [{From, _} | RestAcceptors] ->
-                    gen_statem:reply(From, {ok, ConnPid}),
-                    Data#listener_data{
-                        connections = NewConns2,
-                        conn_monitors = NewMonitors,
-                        acceptors = RestAcceptors
-                    };
-                [] ->
-                    Data#listener_data{
-                        connections = NewConns2,
-                        conn_monitors = NewMonitors,
-                        pending = Data#listener_data.pending ++ [ConnPid]
-                    }
-            end;
-        {error, _Reason} ->
-            Data
-    end.
-
-extract_dcid(<<_FB:8, _Version:32, DCIDLen:8, DCID:DCIDLen/binary, _/binary>>) ->
-    {ok, DCID};
-extract_dcid(_) ->
-    {error, invalid_packet}.

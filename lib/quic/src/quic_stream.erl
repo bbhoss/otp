@@ -66,7 +66,8 @@ new(StreamId, MaxSendData, MaxRecvData) ->
         recv_data_size = 0,
         fin_sent = false,
         fin_received = false,
-        recv_waiters = []
+        recv_waiters = [],
+        owner = self()
     }.
 
 %% ===================================================================

@@ -20,16 +20,22 @@
 %% %CopyrightEnd%
 %%
 
--module(quic_app).
--moduledoc false.
+-module(quic_registry).
 
--behaviour(application).
+-export([init/0, claim/2, release/1]).
 
--export([start/2, stop/1]).
+-define(TABLE, quic_connections).
 
-start(_Type, _StartArgs) ->
-    quic_registry:init(),
-    quic_sup:start_link().
+init() ->
+    ets:new(?TABLE, [set, public, named_table,
+                     {write_concurrency, true},
+                     {read_concurrency, true}]).
 
-stop(_State) ->
-    ok.
+claim(PeerAddr, ConnPid) ->
+    ets:insert_new(?TABLE, {peer_key(PeerAddr), ConnPid}).
+
+release(ConnPid) ->
+    ets:match_delete(?TABLE, {'_', ConnPid}).
+
+peer_key(#{addr := Addr, port := Port}) -> {Addr, Port};
+peer_key(Other) -> Other.

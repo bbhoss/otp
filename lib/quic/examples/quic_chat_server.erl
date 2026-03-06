@@ -127,11 +127,9 @@ stream_handler(Stream) ->
     pending_join(Stream, <<>>).
 
 recv_proxy(Handler, Stream) ->
-    case gen_quic:recv(Stream, 0, 60000) of
+    case gen_quic:recv(Stream, 0, infinity) of
         {ok, Data} ->
             Handler ! {stream_data, Data},
-            recv_proxy(Handler, Stream);
-        {error, timeout} ->
             recv_proxy(Handler, Stream);
         {error, Reason} ->
             Handler ! {stream_error, Reason}

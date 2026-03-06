@@ -263,7 +263,8 @@
     recv_data_size = 0 :: non_neg_integer(),
     fin_sent = false   :: boolean(),
     fin_received = false :: boolean(),
-    recv_waiters = []  :: list()
+    recv_waiters = []  :: list(),
+    owner              :: pid()
 }).
 
 -record(pn_space, {
