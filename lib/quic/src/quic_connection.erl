@@ -247,7 +247,7 @@ idle({call, From}, {connect, Host, Port}, Data) ->
             io:format("[conn:~p] send result: ~p~n", [self(), SendResult]),
 
             %% Start receiving
-            {select, _} = start_recv(Socket),
+            arm_socket(Socket),
 
             PNSpaces = Data#conn_data.pn_spaces,
             InitPN = maps:get(initial, PNSpaces),
@@ -280,7 +280,7 @@ idle({call, From}, {accept_init, LocalAddr, PeerAddr, PacketData}, Data) ->
                                   bytes_recv = byte_size(PacketData)},
             case process_initial_packet(PacketData, Data1) of
                 {ok, Data2} ->
-                    {select, _} = start_recv(Socket),
+                    arm_socket(Socket),
                     io:format("[conn:~p] initial processed OK, app_keys=~p~n",
                               [self(), Data2#conn_data.app_keys =/= undefined]),
                     SCID = Data2#conn_data.scid,
@@ -304,14 +304,11 @@ idle(info, Msg, Data) ->
 %% State: handshake
 %% ===================================================================
 
-handshake(info, {'$socket', Socket, select, _SelectRef}, #conn_data{udp_socket = Socket} = Data) ->
-    case drain_socket(Socket, Data) of
-        {ok, Data2} ->
-            maybe_transition_to_established(Data2);
-        {draining, Data2} ->
-            PTO = quic_recovery:get_pto(Data2#conn_data.recovery),
-            {next_state, draining, Data2,
-             [{state_timeout, round(3 * PTO), drain_complete}]}
+handshake(info, {'$socket', Socket, _, _} = Msg, #conn_data{udp_socket = Socket} = Data) ->
+    case handle_socket_data(Msg, Socket, Data) of
+        {ok, Data2} -> maybe_transition_to_established(Data2);
+        {draining, Data2} -> enter_draining(Data2);
+        abort -> {stop, normal}
     end;
 
 handshake({timeout, pto}, pto_timeout, Data) ->
@@ -508,16 +505,14 @@ established({call, From}, {controlling_process, NewOwner}, Data) ->
     {keep_state, Data#conn_data{owner = NewOwner, owner_mon = MonRef},
      [{reply, From, ok}]};
 
-established(info, {'$socket', Socket, select, _Ref},
+established(info, {'$socket', Socket, _, _} = Msg,
             #conn_data{udp_socket = Socket} = Data) ->
-    case drain_socket(Socket, Data) of
+    case handle_socket_data(Msg, Socket, Data) of
         {ok, Data2} ->
             {keep_state, Data2,
              [idle_timeout_action(Data2) | delayed_ack_actions(Data2)]};
-        {draining, Data2} ->
-            PTO = quic_recovery:get_pto(Data2#conn_data.recovery),
-            {next_state, draining, Data2,
-             [{state_timeout, round(3 * PTO), drain_complete}]}
+        {draining, Data2} -> enter_draining(Data2);
+        abort -> {stop, normal}
     end;
 
 established({timeout, pto}, pto_timeout, Data) ->
@@ -558,19 +553,17 @@ established(info, Msg, Data) ->
 %% State: closing
 %% ===================================================================
 
-closing(info, {'$socket', Socket, select, _Ref},
+closing(info, {'$socket', Socket, _, _} = Msg,
         #conn_data{udp_socket = Socket} = Data) ->
-    case drain_socket(Socket, Data) of
+    case handle_socket_data(Msg, Socket, Data) of
         {ok, Data2} ->
             case Data2#conn_data.close_frame of
                 undefined -> ok;
                 CloseFrameBin -> send_app_data(CloseFrameBin, Data2)
             end,
             {keep_state, Data2};
-        {draining, Data2} ->
-            PTO = quic_recovery:get_pto(Data2#conn_data.recovery),
-            {next_state, draining, Data2,
-             [{state_timeout, round(3 * PTO), drain_complete}]}
+        {draining, Data2} -> enter_draining(Data2);
+        abort -> {stop, normal}
     end;
 
 closing(state_timeout, drain_complete, _Data) ->
@@ -1526,29 +1519,57 @@ aead_cipher(32) -> aes_256_gcm.
 %% Helpers
 %% ===================================================================
 
-start_recv(Socket) ->
-    socket:recv(Socket, 0, [], nowait).
+arm_socket(Socket) ->
+    case socket:recv(Socket, 0, [], nowait) of
+        {select, _} -> ok;
+        {completion, _} -> ok
+    end.
 
-drain_socket(Socket, Data) ->
+handle_socket_data({'$socket', _Socket, select, _Ref}, Socket, Data) ->
+    drain_loop(Socket, Data);
+handle_socket_data({'$socket', _Socket, completion, {_Handle, {ok, PacketData}}}, Socket, Data) ->
+    case process_drain_packet(PacketData, Data) of
+        {ok, Data2} -> drain_loop(Socket, Data2);
+        {draining, _} = Draining -> Draining
+    end;
+handle_socket_data({'$socket', _, completion, {_Handle, {error, _}}}, _Socket, Data) ->
+    {ok, Data};
+handle_socket_data({'$socket', _, abort, _Info}, _Socket, _Data) ->
+    abort.
+
+drain_loop(Socket, Data) ->
     case socket:recv(Socket, 0, [], nowait) of
         {ok, PacketData} ->
-            case process_received_packet(PacketData, Data) of
-                {ok, Data2} ->
-                    Data3 = case Data2#conn_data.handshake_done of
-                        true -> send_handshake_ack(Data2);
-                        false -> Data2
-                    end,
-                    drain_socket(Socket, Data3);
-                {transition_to_draining, Data2} ->
-                    {draining, Data2};
-                {error, _Reason} ->
-                    {ok, Data}
+            case process_drain_packet(PacketData, Data) of
+                {ok, Data2} -> drain_loop(Socket, Data2);
+                {draining, _} = Draining -> Draining
             end;
         {select, _} ->
+            {ok, Data};
+        {completion, _} ->
             {ok, Data};
         {error, _} ->
             {ok, Data}
     end.
+
+process_drain_packet(PacketData, Data) ->
+    case process_received_packet(PacketData, Data) of
+        {ok, Data2} ->
+            Data3 = case Data2#conn_data.handshake_done of
+                true -> send_handshake_ack(Data2);
+                false -> Data2
+            end,
+            {ok, Data3};
+        {transition_to_draining, Data2} ->
+            {draining, Data2};
+        {error, _Reason} ->
+            {ok, Data}
+    end.
+
+enter_draining(Data) ->
+    PTO = quic_recovery:get_pto(Data#conn_data.recovery),
+    {next_state, draining, Data,
+     [{state_timeout, round(3 * PTO), drain_complete}]}.
 
 open_connected_socket(LocalAddr, PeerAddr) ->
     case socket:open(inet, dgram, udp) of
