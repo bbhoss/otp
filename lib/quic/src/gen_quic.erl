@@ -109,7 +109,13 @@ connect(Host, Port, Opts, Timeout) ->
     {ok, pid()} | {error, term()}.
 listen(Port, Opts) ->
     ensure_started(),
-    quic_listener_sup:start_listener(Port, Opts).
+    case quic_listener_sup:start_listener(Port, Opts) of
+        {ok, Pid} ->
+            link(Pid),
+            {ok, Pid};
+        Error ->
+            Error
+    end.
 
 %% @doc Accept an incoming QUIC connection.
 -spec accept(pid()) -> {ok, pid()} | {error, term()}.

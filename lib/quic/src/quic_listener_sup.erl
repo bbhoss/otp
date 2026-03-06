@@ -43,7 +43,7 @@ init([]) ->
         id => quic_listener,
         start => {quic_listener, start_link, []},
         type => worker,
-        restart => permanent,
+        restart => temporary,
         shutdown => 5000
     },
     {ok, {SupFlags, [ChildSpec]}}.

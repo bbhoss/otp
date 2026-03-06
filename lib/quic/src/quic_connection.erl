@@ -42,6 +42,7 @@
     recv/4,
     send_datagram/2,
     recv_datagram/2,
+    stop/1,
     close/2,
     close_stream/2,
     connection_info/1,
@@ -132,7 +133,7 @@ connect(Pid, Host, Port, Timeout) ->
     gen_statem:call(Pid, {connect, Host, Port}, Timeout).
 
 accept_init(Pid, LocalAddr, PeerAddr, InitialPacket) ->
-    gen_statem:call(Pid, {accept_init, LocalAddr, PeerAddr, InitialPacket}, 5000).
+    gen_statem:cast(Pid, {accept_init, LocalAddr, PeerAddr, InitialPacket}).
 
 open_stream(Pid, Opts) ->
     gen_statem:call(Pid, {open_stream, Opts}).
@@ -151,6 +152,9 @@ send_datagram(Pid, Data) ->
 
 recv_datagram(Pid, Timeout) ->
     gen_statem:call(Pid, recv_datagram, Timeout).
+
+stop(Pid) ->
+    gen_statem:stop(Pid).
 
 close(Pid, ErrorCode) ->
     gen_statem:call(Pid, {close, ErrorCode}, 5000).
@@ -246,9 +250,6 @@ idle({call, From}, {connect, Host, Port}, Data) ->
             SendResult = socket:send(Socket, ProtectedPacket),
             io:format("[conn:~p] send result: ~p~n", [self(), SendResult]),
 
-            %% Start receiving
-            arm_socket(Socket),
-
             PNSpaces = Data#conn_data.pn_spaces,
             InitPN = maps:get(initial, PNSpaces),
             NewPNSpaces = PNSpaces#{initial => InitPN#pn_space{next_pn = 1}},
@@ -265,14 +266,15 @@ idle({call, From}, {connect, Host, Port}, Data) ->
                 conn_waiters = [{From, undefined}]
             },
 
-            PTO = quic_recovery:get_pto(Data2#conn_data.recovery),
-            {next_state, handshake, Data2,
+            {ok, Data3} = drain_loop(Socket, Data2),
+            PTO = quic_recovery:get_pto(Data3#conn_data.recovery),
+            {next_state, handshake, Data3,
              [{{timeout, pto}, round(PTO), pto_timeout}]};
         {error, Reason} ->
             {keep_state_and_data, [{reply, From, {error, Reason}}]}
     end;
 
-idle({call, From}, {accept_init, LocalAddr, PeerAddr, PacketData}, Data) ->
+idle(cast, {accept_init, LocalAddr, PeerAddr, PacketData}, Data) ->
     io:format("[conn:~p] accept_init, pkt=~p bytes~n", [self(), byte_size(PacketData)]),
     case open_connected_socket(LocalAddr, PeerAddr) of
         {ok, Socket} ->
@@ -280,20 +282,17 @@ idle({call, From}, {accept_init, LocalAddr, PeerAddr, PacketData}, Data) ->
                                   bytes_recv = byte_size(PacketData)},
             case process_initial_packet(PacketData, Data1) of
                 {ok, Data2} ->
-                    arm_socket(Socket),
+                    {ok, Data3} = drain_loop(Socket, Data2),
                     io:format("[conn:~p] initial processed OK, app_keys=~p~n",
-                              [self(), Data2#conn_data.app_keys =/= undefined]),
-                    SCID = Data2#conn_data.scid,
-                    {next_state, handshake, Data2, [{reply, From, {ok, SCID}}]};
+                              [self(), Data3#conn_data.app_keys =/= undefined]),
+                    {next_state, handshake, Data3};
                 {error, Reason} ->
                     io:format("[conn:~p] initial FAILED: ~p~n", [self(), Reason]),
                     socket:close(Socket),
-                    gen_statem:reply(From, {error, Reason}),
                     {stop, normal}
             end;
         {error, Reason} ->
             io:format("[conn:~p] socket open failed: ~p~n", [self(), Reason]),
-            gen_statem:reply(From, {error, Reason}),
             {stop, normal}
     end;
 
@@ -1525,12 +1524,6 @@ aead_cipher(32) -> aes_256_gcm.
 %% ===================================================================
 %% Helpers
 %% ===================================================================
-
-arm_socket(Socket) ->
-    case socket:recv(Socket, 0, [], nowait) of
-        {select, _} -> ok;
-        {completion, _} -> ok
-    end.
 
 handle_socket_data({'$socket', _Socket, select, _Ref}, Socket, Data) ->
     drain_loop(Socket, Data);

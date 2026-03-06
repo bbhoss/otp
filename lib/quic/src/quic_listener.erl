@@ -167,13 +167,8 @@ create_new_connection(PacketData, PeerAddr, Data) ->
                 true ->
                     monitor(process, ConnPid),
                     {ok, LocalAddr} = socket:sockname(ListenSocket),
-                    case quic_connection:accept_init(ConnPid, LocalAddr,
-                                                      PeerAddr, PacketData) of
-                        {ok, _SCID} ->
-                            ok;
-                        {error, Reason} ->
-                            io:format("[listener] accept_init failed: ~p~n", [Reason])
-                    end,
+                    quic_connection:accept_init(ConnPid, LocalAddr,
+                                                PeerAddr, PacketData),
                     case Data#listener_data.acceptors of
                         [{From, _} | RestAcceptors] ->
                             gen_statem:reply(From, {ok, ConnPid}),
@@ -184,6 +179,7 @@ create_new_connection(PacketData, PeerAddr, Data) ->
                             }
                     end;
                 false ->
+                    quic_connection:stop(ConnPid),
                     Data
             end;
         {error, Reason} ->
