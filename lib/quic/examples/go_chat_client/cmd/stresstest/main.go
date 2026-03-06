@@ -466,11 +466,56 @@ func fuzz(addr string, tlsConf *tls.Config, quicConf *quic.Config) {
 	wg.Wait()
 }
 
+// firehose: maximize concurrent connections and message throughput.
+// Each connection joins a room and blasts messages with no delay.
+func firehose(addr string, conns, msgsPerConn int, tlsConf *tls.Config, quicConf *quic.Config) {
+	log.Printf("[firehose] %d connections, %d msgs each, no delay", conns, msgsPerConn)
+	var wg sync.WaitGroup
+	gate := make(chan struct{})
+	for i := 0; i < conns; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			<-gate
+			nick := fmt.Sprintf("fire-%d", id)
+			conn, err := dial(addr, tlsConf, quicConf)
+			if err != nil {
+				return
+			}
+			defer func() {
+				conn.CloseWithError(0, "done")
+				m.Disconnects.Add(1)
+			}()
+
+			stream, err := openStream(conn)
+			if err != nil {
+				return
+			}
+			if joinRoom(stream, nick, "firehose") != nil {
+				return
+			}
+			drainReads(stream)
+			for j := 0; j < msgsPerConn; j++ {
+				if sendMsg(stream, fmt.Sprintf("%s-%d", nick, j)) != nil {
+					return
+				}
+			}
+		}(i)
+	}
+	close(gate)
+	start := time.Now()
+	wg.Wait()
+	elapsed := time.Since(start)
+	total := int64(conns) * int64(msgsPerConn)
+	rate := float64(total) / elapsed.Seconds()
+	log.Printf("[firehose] done: %d conns × %d msgs = %d total in %v (%.0f msg/s)", conns, msgsPerConn, total, elapsed.Round(time.Millisecond), rate)
+}
+
 func main() {
 	addr := flag.String("addr", "localhost:4433", "server address")
-	scenario := flag.String("scenario", "all", "stampede|churn|multistream|flood|rude|reconnect|bigbang|fuzz|all")
-	clients := flag.Int("clients", 20, "concurrent clients (stampede)")
-	msgs := flag.Int("msgs", 50, "messages per client (stampede)")
+	scenario := flag.String("scenario", "all", "stampede|churn|multistream|flood|rude|reconnect|bigbang|fuzz|firehose|all")
+	clients := flag.Int("clients", 20, "concurrent clients (stampede/firehose)")
+	msgs := flag.Int("msgs", 50, "messages per client (stampede/firehose)")
 	rounds := flag.Int("rounds", 100, "connect/disconnect cycles (churn, reconnect)")
 	streams := flag.Int("streams", 20, "streams per connection (multistream)")
 	floodN := flag.Int("flood-msgs", 1000, "messages to flood")
@@ -521,6 +566,8 @@ func main() {
 			bigbang(*addr, tlsConf, quicConf)
 		case "fuzz":
 			fuzz(*addr, tlsConf, quicConf)
+		case "firehose":
+			firehose(*addr, *clients, *msgs, tlsConf, quicConf)
 		case "all":
 			stampede(*addr, *clients, *msgs, tlsConf, quicConf)
 			churn(*addr, *rounds, tlsConf, quicConf)

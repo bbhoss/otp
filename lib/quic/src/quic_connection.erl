@@ -127,7 +127,7 @@
 %% ===================================================================
 
 start_link(Args) ->
-    gen_statem:start_link(?MODULE, Args, [{debug, [trace]}]).
+    gen_statem:start_link(?MODULE, Args, []).
 
 connect(Pid, Host, Port, Timeout) ->
     gen_statem:call(Pid, {connect, Host, Port}, Timeout).
