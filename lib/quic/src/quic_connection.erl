@@ -601,6 +601,7 @@ draining(info, _, _Data) ->
 terminate(_Reason, _State, #conn_data{udp_socket = undefined}) ->
     ok;
 terminate(_Reason, _State, #conn_data{udp_socket = Socket}) ->
+    quic_registry:release(self()),
     socket:close(Socket),
     ok.
 
