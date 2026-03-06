@@ -43,8 +43,7 @@
     is_bidirectional/1,
     stream_type/1,
     next_stream_id/2,
-    add_recv_waiter/2,
-    notify_recv_waiters/1
+    add_recv_waiter/2
 ]).
 
 %% ===================================================================
@@ -201,14 +200,6 @@ add_recv_waiter(Stream, Waiter) ->
     Stream#quic_stream{
         recv_waiters = Stream#quic_stream.recv_waiters ++ [Waiter]
     }.
-
-%% @doc Notify all waiting processes that data is available.
--spec notify_recv_waiters(#quic_stream{}) -> #quic_stream{}.
-notify_recv_waiters(#quic_stream{recv_waiters = []} = Stream) ->
-    Stream;
-notify_recv_waiters(#quic_stream{recv_waiters = Waiters} = Stream) ->
-    [From ! {quic_data_available, Stream#quic_stream.id} || From <- Waiters],
-    Stream#quic_stream{recv_waiters = []}.
 
 %% ===================================================================
 %% Internal

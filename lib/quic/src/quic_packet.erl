@@ -46,7 +46,8 @@
     encode_packet_number/2,
     decode_packet_number/3,
     packet_number_length/1,
-    pad_initial/2
+    pad_initial/2,
+    initial_padding/2
 ]).
 
 %% ===================================================================
@@ -110,11 +111,25 @@ encode_version_negotiation(DCID, SCID, Versions) ->
       SCIDLen:8, SCID/binary,
       VersionsBin/binary>>.
 
-%% @doc Pad an Initial packet to at least MinSize bytes.
+%% @doc Calculate padding needed to reach MinSize and return it as PADDING frames
+%% to include in the payload BEFORE encoding.
 %% Initial packets must be at least 1200 bytes (RFC 9000, Section 14.1).
+-spec initial_padding(non_neg_integer(), non_neg_integer()) -> binary().
+initial_padding(CurrentPayloadSize, MinSize) ->
+    %% Estimate overhead: 1 (first byte) + 4 (version) + 1+8 (DCID) + 1+8 (SCID)
+    %%   + 1 (token len 0) + 2 (Length varint ~2 bytes) + 1-4 (PN) + 16 (AEAD tag)
+    %% ~42 bytes overhead. Be conservative:
+    Overhead = 50,
+    PadLen = max(0, MinSize - CurrentPayloadSize - Overhead),
+    <<0:(PadLen * 8)>>.
+
+%% @doc Pad an encoded packet to at least MinSize by appending PADDING frames
+%% inside the payload area. This updates the Length field to account for padding.
 -spec pad_initial(binary(), non_neg_integer()) -> binary().
+pad_initial(Packet, MinSize) when byte_size(Packet) >= MinSize ->
+    Packet;
 pad_initial(Packet, MinSize) ->
-    PadLen = max(0, MinSize - byte_size(Packet)),
+    PadLen = MinSize - byte_size(Packet),
     <<Packet/binary, 0:(PadLen * 8)>>.
 
 %% ===================================================================

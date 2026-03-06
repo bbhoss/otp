@@ -28,14 +28,13 @@
 -module(quic_SUITE).
 
 -include_lib("common_test/include/ct.hrl").
--include("../src/quic.hrl").
+-include("quic.hrl").
 
 -export([all/0, groups/0, init_per_suite/1, end_per_suite/1,
          init_per_testcase/2, end_per_testcase/2]).
 -export([
     echo_test/1,
     multi_stream_test/1,
-    active_echo_test/1,
     datagram_echo_test/1,
     connection_info_test/1,
     transport_params_roundtrip/1,
@@ -53,7 +52,6 @@ groups() ->
      {integration_tests, [sequence], [
         echo_test,
         multi_stream_test,
-        active_echo_test,
         datagram_echo_test,
         connection_info_test
     ]}].
@@ -108,9 +106,11 @@ packet_encode_decode(_Config) ->
     DCID = <<1,2,3,4,5,6,7,8>>,
     SCID = <<9,10,11,12,13,14,15,16>>,
 
-    %% Initial packet
-    Payload = <<"test payload">>,
-    Bin = quic_packet:encode_initial(DCID, SCID, <<>>, 0, Payload),
+    %% Initial packet — encode_initial bakes 16-byte AEAD tag into Length field,
+    %% so append 16 zero bytes to simulate the tag for decode_header to succeed.
+    RawPayload = <<"test payload">>,
+    Bin0 = quic_packet:encode_initial(DCID, SCID, <<>>, 0, RawPayload),
+    Bin = <<Bin0/binary, 0:128>>,
     {ok, Pkt, _Rest} = quic_packet:decode_header(Bin),
     initial = Pkt#quic_packet.type,
     DCID = Pkt#quic_packet.dcid,
@@ -144,7 +144,6 @@ echo_test(Config) ->
     %% Start echo server
     {ok, L} = gen_quic:listen(Port, [
         binary,
-        {active, false},
         {certfile, CertFile},
         {keyfile, KeyFile},
         {alpn, [<<"echo">>]},
@@ -160,7 +159,6 @@ echo_test(Config) ->
     %% Client connects
     {ok, Conn} = gen_quic:connect("localhost", Port, [
         binary,
-        {active, false},
         {alpn, [<<"echo">>]},
         {verify, verify_none}
     ], 5000),
@@ -185,16 +183,14 @@ multi_stream_test(Config) ->
     ok = quic:start(),
 
     {ok, L} = gen_quic:listen(Port, [
-        binary, {active, false},
-        {certfile, CertFile}, {keyfile, KeyFile},
+        binary, {certfile, CertFile}, {keyfile, KeyFile},
         {alpn, [<<"echo">>]}
     ]),
 
     _ServerPid = spawn_link(fun() -> echo_server(L) end),
 
     {ok, Conn} = gen_quic:connect("localhost", Port, [
-        binary, {active, false},
-        {alpn, [<<"echo">>]}, {verify, verify_none}
+        binary, {alpn, [<<"echo">>]}, {verify, verify_none}
     ], 5000),
 
     %% Open multiple streams
@@ -216,39 +212,6 @@ multi_stream_test(Config) ->
     gen_quic:close(L),
     ok.
 
-active_echo_test(Config) ->
-    Port = ?config(port, Config),
-    CertFile = ?config(certfile, Config),
-    KeyFile = ?config(keyfile, Config),
-
-    ok = quic:start(),
-
-    {ok, L} = gen_quic:listen(Port, [
-        binary, {active, true},
-        {certfile, CertFile}, {keyfile, KeyFile},
-        {alpn, [<<"echo">>]}
-    ]),
-
-    spawn_link(fun() -> active_echo_server(L) end),
-
-    {ok, Conn} = gen_quic:connect("localhost", Port, [
-        binary, {active, true},
-        {alpn, [<<"echo">>]}, {verify, verify_none}
-    ], 5000),
-
-    {ok, Stream} = gen_quic:open_stream(Conn),
-    ok = gen_quic:send(Stream, <<"active mode echo">>),
-
-    receive
-        {quic, Stream, <<"active mode echo">>} -> ok
-    after 5000 ->
-        ct:fail(active_echo_timeout)
-    end,
-
-    gen_quic:close(Conn),
-    gen_quic:close(L),
-    ok.
-
 datagram_echo_test(Config) ->
     Port = ?config(port, Config),
     CertFile = ?config(certfile, Config),
@@ -257,8 +220,7 @@ datagram_echo_test(Config) ->
     ok = quic:start(),
 
     {ok, L} = gen_quic:listen(Port, [
-        binary, {active, false},
-        {certfile, CertFile}, {keyfile, KeyFile},
+        binary, {certfile, CertFile}, {keyfile, KeyFile},
         {alpn, [<<"echo">>]},
         {max_datagram_frame_size, 1200}
     ]),
@@ -266,8 +228,7 @@ datagram_echo_test(Config) ->
     spawn_link(fun() -> datagram_echo_server(L) end),
 
     {ok, Conn} = gen_quic:connect("localhost", Port, [
-        binary, {active, false},
-        {alpn, [<<"echo">>]}, {verify, verify_none},
+        binary, {alpn, [<<"echo">>]}, {verify, verify_none},
         {max_datagram_frame_size, 1200}
     ], 5000),
 
@@ -286,16 +247,14 @@ connection_info_test(Config) ->
     ok = quic:start(),
 
     {ok, L} = gen_quic:listen(Port, [
-        binary, {active, false},
-        {certfile, CertFile}, {keyfile, KeyFile},
+        binary, {certfile, CertFile}, {keyfile, KeyFile},
         {alpn, [<<"echo">>]}
     ]),
 
     spawn_link(fun() -> echo_server(L) end),
 
     {ok, Conn} = gen_quic:connect("localhost", Port, [
-        binary, {active, false},
-        {alpn, [<<"echo">>]}, {verify, verify_none}
+        binary, {alpn, [<<"echo">>]}, {verify, verify_none}
     ], 5000),
 
     {ok, Info} = gen_quic:connection_info(Conn),
@@ -334,24 +293,6 @@ echo_stream(Stream) ->
             ok;
         {error, _Reason} ->
             gen_quic:close_stream(Stream)
-    end.
-
-active_echo_server(L) ->
-    {ok, Conn} = gen_quic:accept(L),
-    spawn_link(fun() -> active_echo_server(L) end),
-    active_echo_conn_loop(Conn, #{}).
-
-active_echo_conn_loop(Conn, Streams) ->
-    receive
-        {quic_stream_opened, Conn, Stream} ->
-            active_echo_conn_loop(Conn, Streams#{Stream => true});
-        {quic, Stream, Data} ->
-            gen_quic:send(Stream, Data),
-            active_echo_conn_loop(Conn, Streams);
-        {quic_stream_closed, _Stream} ->
-            active_echo_conn_loop(Conn, Streams);
-        {quic_closed, Conn} ->
-            ok
     end.
 
 datagram_echo_server(L) ->

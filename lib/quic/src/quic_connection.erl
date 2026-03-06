@@ -61,7 +61,6 @@
     terminate/3
 ]).
 
-%% Internal state
 -record(conn_data, {
     role                :: client | server,
     owner               :: pid(),
@@ -72,55 +71,55 @@
     dcid                :: binary(),
     scid                :: binary(),
     original_dcid       :: binary(),
-    %% Crypto keys per level
     initial_keys        :: map() | undefined,
     handshake_keys      :: map() | undefined,
     app_keys            :: map() | undefined,
-    %% TLS state
+    prev_peer_keys      :: {map(), integer()} | undefined,
     tls_state           :: term() | undefined,
-    %% Streams
     streams = #{}       :: #{non_neg_integer() => #quic_stream{}},
     next_bidi_stream    :: non_neg_integer(),
     next_uni_stream     :: non_neg_integer(),
-    %% Flow control
+    max_streams_bidi_remote = 0 :: non_neg_integer(),
+    max_streams_uni_remote = 0  :: non_neg_integer(),
     max_data_local = 1048576   :: non_neg_integer(),
     max_data_remote = 0        :: non_neg_integer(),
     data_sent = 0              :: non_neg_integer(),
     data_recvd = 0             :: non_neg_integer(),
-    %% Packet number spaces
     pn_spaces = #{
         initial => #pn_space{},
         handshake => #pn_space{},
         application => #pn_space{}
     } :: map(),
-    %% Recovery
     recovery            :: #recovery{},
-    %% Transport params
     local_params        :: #transport_params{},
     remote_params       :: #transport_params{} | undefined,
-    %% Active mode
-    active = false      :: true | false | once | integer(),
-    mode = binary       :: binary | list,
-    %% Waiters
+    pending_streams = [] :: [non_neg_integer()],
     stream_acceptors = [] :: [{pid(), reference()}],
     conn_waiters = []     :: [{pid(), reference()}],
     datagram_queue = []   :: [binary()],
     datagram_waiters = [] :: [{pid(), reference()}],
-    %% Options
     alpn                :: [binary()],
     verify = verify_none :: verify_peer | verify_none,
     certfile            :: string() | undefined,
     keyfile             :: string() | undefined,
-    %% Idle timeout
     idle_timeout = 30000 :: non_neg_integer(),
-    %% PTO timer
-    pto_timer           :: reference() | undefined,
-    %% Handshake complete flag (set when TLS handshake_complete action received)
     handshake_done = false :: boolean(),
-    %% Key update state (RFC 9001 Section 6)
+    handshake_confirmed = false :: boolean(),
     key_phase = 0          :: 0 | 1,
     client_app_secret      :: binary() | undefined,
-    server_app_secret      :: binary() | undefined
+    server_app_secret      :: binary() | undefined,
+    hash_algo = sha256     :: sha256 | sha384,
+    key_len = 16           :: pos_integer(),
+    close_frame            :: binary() | undefined,
+    ack_eliciting_count = 0 :: non_neg_integer(),
+    last_ack_eliciting_time :: integer() | undefined,
+    peer_cids = []         :: [#{seq := non_neg_integer(), cid := binary(), token := binary()}],
+    bytes_recv = 0         :: non_neg_integer(),
+    bytes_sent = 0         :: non_neg_integer(),
+    address_validated = false :: boolean(),
+    sent_with_current_key = false :: boolean(),
+    acked_with_current_key = false :: boolean(),
+    coalesce_buffer = <<>> :: binary()
 }).
 
 %% ===================================================================
@@ -128,7 +127,7 @@
 %% ===================================================================
 
 start_link(Args) ->
-    gen_statem:start_link(?MODULE, Args, []).
+    gen_statem:start_link(?MODULE, Args, [{debug, [trace]}]).
 
 connect(Pid, Host, Port, Timeout) ->
     gen_statem:call(Pid, {connect, Host, Port}, Timeout).
@@ -181,9 +180,6 @@ init(#{role := Role, owner := Owner, options := Opts}) ->
 
     %% Parse options
     ALPN = proplists:get_value(alpn, Opts, []),
-    Active = proplists:get_value(active, Opts, false),
-    Mode = case lists:member(binary, Opts) of true -> binary; _ ->
-               case lists:member(list, Opts) of true -> list; _ -> binary end end,
     Verify = proplists:get_value(verify, Opts, verify_none),
     CertFile = proplists:get_value(certfile, Opts, undefined),
     KeyFile = proplists:get_value(keyfile, Opts, undefined),
@@ -207,8 +203,6 @@ init(#{role := Role, owner := Owner, options := Opts}) ->
         next_uni_stream = NextUni,
         recovery = quic_recovery:init(),
         local_params = LocalParams,
-        active = Active,
-        mode = Mode,
         alpn = ALPN,
         verify = Verify,
         certfile = CertFile,
@@ -240,18 +234,15 @@ idle({call, From}, {connect, Host, Port}, Data) ->
                                                      Data#conn_data.local_params),
             {CHBin, TLSState} = quic_tls:get_client_hello(TLSState0),
 
-            %% Build Initial packet with ClientHello in CRYPTO frame
             CryptoFrame = quic_frame:encode({crypto, 0, CHBin}),
-            PaddingLen = max(0, 1200 - 100 - byte_size(CryptoFrame)),
-            Payload = <<CryptoFrame/binary, 0:PaddingLen/unit:8>>,
+            Padding = quic_packet:initial_padding(byte_size(CryptoFrame), 1200),
+            Payload = <<CryptoFrame/binary, Padding/binary>>,
 
             #{client := ClientKeys} = InitialKeys,
             Packet = quic_packet:encode_initial(DCID, Data#conn_data.scid,
                                                  <<>>, 0, Payload),
-            PaddedPacket = quic_packet:pad_initial(Packet, 1200),
 
-            %% Protect the packet
-            ProtectedPacket = protect_initial_packet(PaddedPacket, 0, ClientKeys),
+            ProtectedPacket = protect_initial_packet(Packet, 0, ClientKeys),
 
             %% Send
             io:format("[conn:~p] client sending Initial, ~p bytes to ~p~n",
@@ -279,11 +270,9 @@ idle({call, From}, {connect, Host, Port}, Data) ->
                 conn_waiters = [{From, undefined}]
             },
 
-            %% Set PTO timer
             PTO = quic_recovery:get_pto(Data2#conn_data.recovery),
-            PTOTimer = erlang:send_after(round(PTO), self(), pto_timeout),
-
-            {next_state, handshake, Data2#conn_data{pto_timer = PTOTimer}};
+            {next_state, handshake, Data2,
+             [{{timeout, pto}, round(PTO), pto_timeout}]};
         {error, Reason} ->
             {keep_state_and_data, [{reply, From, {error, Reason}}]}
     end;
@@ -291,7 +280,8 @@ idle({call, From}, {connect, Host, Port}, Data) ->
 idle({call, From}, {accept_init, Socket, PeerAddr, PacketData}, Data) ->
     %% Server receiving initial packet — set socket/peer first so TLS can send
     io:format("[conn:~p] accept_init, pkt=~p bytes~n", [self(), byte_size(PacketData)]),
-    Data1 = Data#conn_data{udp_socket = Socket, peer_addr = PeerAddr},
+    Data1 = Data#conn_data{udp_socket = Socket, peer_addr = PeerAddr,
+                          bytes_recv = byte_size(PacketData)},
     case process_initial_packet(PacketData, Data1) of
         {ok, Data2} ->
             io:format("[conn:~p] initial processed OK, app_keys=~p~n",
@@ -314,12 +304,15 @@ idle(info, Msg, Data) ->
 handshake(cast, {packet, PacketData, _PeerAddr}, Data) ->
     case process_received_packet(PacketData, Data) of
         {ok, Data2} ->
-            %% If handshake just completed, send ACK for client's Handshake
             Data3 = case Data2#conn_data.handshake_done of
                 true -> send_handshake_ack(Data2);
                 false -> Data2
             end,
             maybe_transition_to_established(Data3);
+        {transition_to_draining, Data2} ->
+            PTO = quic_recovery:get_pto(Data2#conn_data.recovery),
+            {next_state, draining, Data2,
+             [{state_timeout, round(3 * PTO), drain_complete}]};
         {error, Reason} ->
             io:format("[conn:~p] handshake packet FAILED: ~p~n", [self(), Reason]),
             {keep_state, Data}
@@ -331,15 +324,13 @@ handshake(info, {'$socket', Socket, select, _SelectRef}, #conn_data{udp_socket =
 handshake(info, {handshake_drain, Socket}, #conn_data{udp_socket = Socket} = Data) ->
     handshake_drain(Socket, Data);
 
-handshake(info, pto_timeout, Data) ->
-    %% PTO fired during handshake - retransmit
-    %% For now, just reset the timer
-    PTO = quic_recovery:get_pto(Data#conn_data.recovery),
+handshake({timeout, pto}, pto_timeout, Data) ->
     NewRecovery = Data#conn_data.recovery#recovery{
         pto_count = Data#conn_data.recovery#recovery.pto_count + 1
     },
-    PTOTimer = erlang:send_after(round(PTO * 2), self(), pto_timeout),
-    {keep_state, Data#conn_data{recovery = NewRecovery, pto_timer = PTOTimer}};
+    PTO = quic_recovery:get_pto(NewRecovery, handshake),
+    {keep_state, Data#conn_data{recovery = NewRecovery},
+     [{{timeout, pto}, round(PTO), pto_timeout}]};
 
 handshake({call, From}, {send, _StreamId, _Data}, _Data2) ->
     {keep_state_and_data, [{reply, From, {error, not_established}}]};
@@ -369,48 +360,79 @@ established({call, From}, {open_stream, Opts}, Data) ->
         true -> unidirectional;
         false -> bidirectional
     end,
-    {StreamId, Data2} = allocate_stream_id(Type, Data),
-    MaxSend = case Type of
-        bidirectional ->
-            case Data2#conn_data.remote_params of
-                #transport_params{initial_max_stream_data_bidi_remote = V} -> V;
-                _ -> 0
-            end;
-        unidirectional ->
-            case Data2#conn_data.remote_params of
-                #transport_params{initial_max_stream_data_uni = V} -> V;
-                _ -> 0
-            end
+    MaxAllowed = case Type of
+        bidirectional -> Data#conn_data.max_streams_bidi_remote;
+        unidirectional -> Data#conn_data.max_streams_uni_remote
     end,
-    MaxRecv = case Type of
-        bidirectional ->
-            Data2#conn_data.local_params#transport_params.initial_max_stream_data_bidi_local;
-        unidirectional -> 0
+    NextId = case Type of
+        bidirectional -> Data#conn_data.next_bidi_stream;
+        unidirectional -> Data#conn_data.next_uni_stream
     end,
-    Stream = quic_stream:new(StreamId, MaxSend, MaxRecv),
-    Streams = maps:put(StreamId, Stream, Data2#conn_data.streams),
-    StreamRef = {quic_stream, self(), StreamId},
-    {keep_state, Data2#conn_data{streams = Streams},
-     [{reply, From, {ok, StreamRef}}]};
+    StreamCount = NextId div 4,
+    case StreamCount >= MaxAllowed andalso MaxAllowed > 0 of
+        true ->
+            {keep_state_and_data, [{reply, From, {error, stream_limit}}]};
+        false ->
+            {StreamId, Data2} = allocate_stream_id(Type, Data),
+            MaxSend = case Type of
+                bidirectional ->
+                    case Data2#conn_data.remote_params of
+                        #transport_params{initial_max_stream_data_bidi_remote = V} -> V;
+                        _ -> 0
+                    end;
+                unidirectional ->
+                    case Data2#conn_data.remote_params of
+                        #transport_params{initial_max_stream_data_uni = V} -> V;
+                        _ -> 0
+                    end
+            end,
+            MaxRecv = case Type of
+                bidirectional ->
+                    Data2#conn_data.local_params#transport_params.initial_max_stream_data_bidi_local;
+                unidirectional -> 0
+            end,
+            Stream = quic_stream:new(StreamId, MaxSend, MaxRecv),
+            Streams = maps:put(StreamId, Stream, Data2#conn_data.streams),
+            StreamRef = {quic_stream, self(), StreamId},
+            {keep_state, Data2#conn_data{streams = Streams},
+             [{reply, From, {ok, StreamRef}}]}
+    end;
 
 established({call, From}, accept_stream, Data) ->
-    Data2 = Data#conn_data{
-        stream_acceptors = Data#conn_data.stream_acceptors ++ [{From, undefined}]
-    },
-    {keep_state, Data2};
+    case Data#conn_data.pending_streams of
+        [StreamId | Rest] ->
+            StreamRef = {quic_stream, self(), StreamId},
+            {keep_state, Data#conn_data{pending_streams = Rest},
+             [{reply, From, {ok, StreamRef}}]};
+        [] ->
+            Data2 = Data#conn_data{
+                stream_acceptors = Data#conn_data.stream_acceptors ++ [{From, undefined}]
+            },
+            {keep_state, Data2}
+    end;
 
 established({call, From}, {send, StreamId, SendData}, Data) ->
     case maps:find(StreamId, Data#conn_data.streams) of
         {ok, Stream} ->
-            case quic_stream:send(Stream, SendData) of
-                {ok, Frames, NewStream} ->
-                    Streams = maps:put(StreamId, NewStream, Data#conn_data.streams),
-                    Data2 = Data#conn_data{streams = Streams},
-                    %% Send frames
-                    Data3 = send_stream_frames(Frames, Data2),
-                    {keep_state, Data3, [{reply, From, ok}]};
-                {error, _} = Error ->
-                    {keep_state_and_data, [{reply, From, Error}]}
+            FrameSize = byte_size(SendData),
+            case Data#conn_data.data_sent + FrameSize > Data#conn_data.max_data_remote of
+                true ->
+                    BlockedFrame = quic_frame:encode({data_blocked, Data#conn_data.max_data_remote}),
+                    Data2 = send_app_data(BlockedFrame, Data),
+                    {keep_state, Data2, [{reply, From, {error, flow_control_blocked}}]};
+                false ->
+                    case quic_stream:send(Stream, SendData) of
+                        {ok, Frames, NewStream} ->
+                            Streams = maps:put(StreamId, NewStream, Data#conn_data.streams),
+                            Data2 = Data#conn_data{
+                                streams = Streams,
+                                data_sent = Data#conn_data.data_sent + FrameSize
+                            },
+                            Data3 = send_stream_frames(Frames, Data2),
+                            {keep_state, Data3, [{reply, From, ok}]};
+                        {error, _} = Error ->
+                            {keep_state_and_data, [{reply, From, Error}]}
+                    end
             end;
         error ->
             {keep_state_and_data, [{reply, From, {error, unknown_stream}}]}
@@ -472,12 +494,13 @@ established({call, From}, recv_datagram, Data) ->
     end;
 
 established({call, From}, {close, ErrorCode}, Data) ->
-    %% Send CONNECTION_CLOSE
-    CloseFrame = quic_frame:encode({connection_close, ErrorCode, 0, <<>>}),
-    Data2 = send_app_data(CloseFrame, Data),
-    %% Notify owner
-    Data2#conn_data.owner ! {quic_closed, self()},
-    {next_state, closing, Data2, [{reply, From, ok}]};
+    CloseFrameBin = quic_frame:encode({connection_close, ErrorCode, 0, <<>>}),
+    Data2 = send_app_data(CloseFrameBin, Data),
+    reply_to_all_waiters(Data2),
+    PTO = quic_recovery:get_pto(Data2#conn_data.recovery),
+    {next_state, closing, Data2#conn_data{close_frame = CloseFrameBin},
+     [{reply, From, ok},
+      {state_timeout, round(3 * PTO), drain_complete}]};
 
 established({call, From}, connection_info, Data) ->
     Info = #{
@@ -498,7 +521,11 @@ established({call, From}, {controlling_process, NewOwner}, Data) ->
 established(cast, {packet, PacketData, _PeerAddr}, Data) ->
     case process_received_packet(PacketData, Data) of
         {ok, Data2} ->
-            {keep_state, Data2, [idle_timeout_action(Data2)]};
+            {keep_state, Data2, [idle_timeout_action(Data2) | delayed_ack_actions(Data2)]};
+        {transition_to_draining, Data2} ->
+            PTO = quic_recovery:get_pto(Data2#conn_data.recovery),
+            {next_state, draining, Data2,
+             [{state_timeout, round(3 * PTO), drain_complete}]};
         {error, _} -> {keep_state, Data}
     end;
 
@@ -509,7 +536,12 @@ established(info, {'$socket', Socket, select, _Ref},
             start_recv(Socket),
             case process_received_packet(PacketData, Data) of
                 {ok, Data2} ->
-                    {keep_state, Data2, [idle_timeout_action(Data2)]};
+                    {keep_state, Data2,
+                     [idle_timeout_action(Data2) | delayed_ack_actions(Data2)]};
+                {transition_to_draining, Data2} ->
+                    PTO = quic_recovery:get_pto(Data2#conn_data.recovery),
+                    {next_state, draining, Data2,
+                     [{state_timeout, round(3 * PTO), drain_complete}]};
                 {error, _} -> {keep_state, Data}
             end;
         {select, _} ->
@@ -518,44 +550,36 @@ established(info, {'$socket', Socket, select, _Ref},
             {keep_state, Data}
     end;
 
-established(info, {quic_data_available, StreamId}, Data) ->
-    %% Stream has data - check for waiters
-    case maps:find(StreamId, Data#conn_data.streams) of
-        {ok, #quic_stream{recv_waiters = [{From, Length} | RestW]} = Stream} ->
-            {ReadData, NewStream0} = quic_stream:read(Stream, Length),
-            NewStream = NewStream0#quic_stream{recv_waiters = RestW},
-            Streams = maps:put(StreamId, NewStream, Data#conn_data.streams),
-            case byte_size(ReadData) > 0 of
-                true ->
-                    gen_statem:reply(From, {ok, ReadData}),
-                    {keep_state, Data#conn_data{streams = Streams}};
-                false ->
-                    {keep_state, Data#conn_data{streams = Streams}}
-            end;
-        _ ->
+established({timeout, pto}, pto_timeout, Data) ->
+    case Data#conn_data.recovery#recovery.bytes_in_flight > 0 of
+        true ->
+            PingFrame = quic_frame:encode(ping),
+            Data2 = send_app_data(PingFrame, Data),
+            NewRecovery = Data2#conn_data.recovery#recovery{
+                pto_count = Data2#conn_data.recovery#recovery.pto_count + 1
+            },
+            PTO = quic_recovery:get_pto(NewRecovery),
+            {keep_state, Data2#conn_data{recovery = NewRecovery},
+             [{{timeout, pto}, round(PTO), pto_timeout}]};
+        false ->
             {keep_state, Data}
     end;
 
-established(info, pto_timeout, Data) ->
-    %% PTO timeout - send a PING
-    PingFrame = quic_frame:encode(ping),
-    Data2 = send_app_data(PingFrame, Data),
-    PTO = quic_recovery:get_pto(Data2#conn_data.recovery),
-    NewRecovery = Data2#conn_data.recovery#recovery{
-        pto_count = Data2#conn_data.recovery#recovery.pto_count + 1
-    },
-    PTOTimer = erlang:send_after(round(PTO), self(), pto_timeout),
-    {keep_state, Data2#conn_data{recovery = NewRecovery, pto_timer = PTOTimer}};
-
 established({timeout, idle}, idle_timeout, Data) ->
-    Data#conn_data.owner ! {quic_closed, self()},
-    {next_state, draining, Data};
+    reply_to_all_waiters(Data),
+    PTO = quic_recovery:get_pto(Data#conn_data.recovery),
+    {next_state, draining, Data,
+     [{state_timeout, round(3 * PTO), drain_complete}]};
 
-established(info, keepalive, Data) ->
+established({timeout, delayed_ack}, delayed_ack, Data) ->
+    Data2 = send_app_ack_now(Data),
+    {keep_state, Data2};
+
+established({timeout, keepalive}, keepalive, Data) ->
     PingFrame = quic_frame:encode(ping),
     Data2 = send_app_data(PingFrame, Data),
-    start_keepalive_timer(Data2#conn_data.idle_timeout),
-    {keep_state, Data2};
+    {keep_state, Data2,
+     [keepalive_action(Data2#conn_data.idle_timeout)]};
 
 established(info, Msg, Data) ->
     handle_common_info(Msg, established, Data).
@@ -564,27 +588,42 @@ established(info, Msg, Data) ->
 %% State: closing
 %% ===================================================================
 
+closing(cast, {packet, _PacketData, _PeerAddr}, Data) ->
+    case Data#conn_data.close_frame of
+        undefined -> keep_state_and_data;
+        CloseFrameBin ->
+            send_app_data(CloseFrameBin, Data),
+            keep_state_and_data
+    end;
+
 closing(info, {'$socket', Socket, select, _Ref},
         #conn_data{udp_socket = Socket} = Data) ->
-    %% Drain remaining packets
-    socket:recvfrom(Socket, 0, [], nowait),
-    start_recv(Socket),
-    {keep_state, Data};
+    case socket:recvfrom(Socket, 0, [], nowait) of
+        {ok, {_Source, _PacketData}} ->
+            start_recv(Socket),
+            case Data#conn_data.close_frame of
+                undefined -> ok;
+                CloseFrameBin -> send_app_data(CloseFrameBin, Data)
+            end,
+            {keep_state, Data};
+        _ ->
+            {keep_state, Data}
+    end;
+
+closing(state_timeout, drain_complete, _Data) ->
+    {stop, normal};
 
 closing({call, From}, _, _Data) ->
     {keep_state_and_data, [{reply, From, {error, closing}}]};
 
-closing(info, _Msg, Data) ->
-    %% After 3x PTO, transition to closed
-    PTO = quic_recovery:get_pto(Data#conn_data.recovery),
-    erlang:send_after(round(3 * PTO), self(), drain_complete),
-    {next_state, draining, Data}.
+closing(info, _Msg, _Data) ->
+    keep_state_and_data.
 
 %% ===================================================================
 %% State: draining
 %% ===================================================================
 
-draining(info, drain_complete, _Data) ->
+draining(state_timeout, drain_complete, _Data) ->
     {stop, normal};
 
 draining({call, From}, _, _Data) ->
@@ -682,16 +721,52 @@ process_server_initial(OrigDCID, PeerSCID, CryptoData, InitialKeys, Data) ->
     end.
 
 process_received_packet(PacketData, Data) ->
-    %% Determine packet type from first byte
-    case PacketData of
-        <<1:1, _:7, _/binary>> ->
-            %% Long header
-            process_long_header_packet(PacketData, Data);
-        <<0:1, _:7, _/binary>> ->
-            %% Short header (1-RTT)
-            process_short_header_packet(PacketData, Data);
+    Data0 = Data#conn_data{
+        bytes_recv = Data#conn_data.bytes_recv + byte_size(PacketData)
+    },
+    process_coalesced_packets(PacketData, Data0).
+
+process_coalesced_packets(<<>>, Data) ->
+    {ok, Data};
+process_coalesced_packets(<<1:1, _:7, _/binary>> = PacketData, Data) ->
+    {ThisPacket, RestPackets} = split_long_packet(PacketData),
+    case process_long_header_packet(ThisPacket, Data) of
+        {ok, Data1} ->
+            process_coalesced_packets(RestPackets, Data1);
+        {transition_to_draining, _} = Trans ->
+            Trans;
+        {error, _} ->
+            process_coalesced_packets(RestPackets, Data)
+    end;
+process_coalesced_packets(<<0:1, _:7, _/binary>> = PacketData, Data) ->
+    process_short_header_packet(PacketData, Data);
+process_coalesced_packets(_, _Data) ->
+    {error, invalid_packet}.
+
+split_long_packet(PacketData) ->
+    <<_FB:8, _Version:32, DCIDLen:8, _DCID:DCIDLen/binary,
+      SCIDLen:8, _SCID:SCIDLen/binary, Rest/binary>> = PacketData,
+    BaseLen = 1 + 4 + 1 + DCIDLen + 1 + SCIDLen,
+    <<FB:8, _/binary>> = PacketData,
+    Type = (FB band 16#30) bsr 4,
+    {TokenFieldSize, AfterToken} = case Type of
+        ?INITIAL_PACKET ->
+            {TLen, R1} = quic_varint:decode(Rest),
+            TVarIntLen = byte_size(Rest) - byte_size(R1),
+            <<_Token:TLen/binary, AT/binary>> = R1,
+            {TVarIntLen + TLen, AT};
         _ ->
-            {error, invalid_packet}
+            {0, Rest}
+    end,
+    {Length, R2} = quic_varint:decode(AfterToken),
+    LenFieldSize = byte_size(AfterToken) - byte_size(R2),
+    TotalSize = BaseLen + TokenFieldSize + LenFieldSize + Length,
+    case byte_size(PacketData) > TotalSize of
+        true ->
+            <<ThisPacket:TotalSize/binary, RestPackets/binary>> = PacketData,
+            {ThisPacket, RestPackets};
+        false ->
+            {PacketData, <<>>}
     end.
 
 process_long_header_packet(PacketData, Data) ->
@@ -703,39 +778,56 @@ process_long_header_packet(PacketData, Data) ->
 
     case Type of
         ?INITIAL_PACKET ->
-            %% Initial packet
-            #{client := ClientKeys, server := _ServerKeys} = Data#conn_data.initial_keys,
-            Keys = case Data#conn_data.role of
-                server -> ClientKeys;
-                client ->
-                    #{server := SK} = Data#conn_data.initial_keys,
-                    SK
-            end,
-            case quic_crypto:unprotect_packet(PacketData, 0, Keys, true) of
-                {ok, _Header, Payload, _PN} ->
-                    case quic_frame:decode_all(Payload) of
-                        {ok, Frames} ->
-                            process_frames(Frames, initial, Data);
+            case Data#conn_data.initial_keys of
+                undefined ->
+                    {ok, Data};
+                InitKeys ->
+                    Keys = case Data#conn_data.role of
+                        server -> maps:get(client, InitKeys);
+                        client -> maps:get(server, InitKeys)
+                    end,
+                    PNSpaces = Data#conn_data.pn_spaces,
+                    InitPNSpace = maps:get(initial, PNSpaces),
+                    LargestRecv = max(0, InitPNSpace#pn_space.largest_received),
+                    case quic_crypto:unprotect_packet(PacketData, LargestRecv, Keys, true) of
+                        {ok, _Header, Payload, PN} ->
+                            NewInitPN = InitPNSpace#pn_space{
+                                largest_received = max(PN, InitPNSpace#pn_space.largest_received),
+                                received_pns = lists:usort([PN | InitPNSpace#pn_space.received_pns])
+                            },
+                            NewPNSpaces = PNSpaces#{initial => NewInitPN},
+                            Data1 = Data#conn_data{pn_spaces = NewPNSpaces},
+                            case quic_frame:decode_all(Payload) of
+                                {ok, Frames} ->
+                                    process_frames(Frames, initial, Data1);
+                                {error, _} = Err -> Err
+                            end;
                         {error, _} = Err -> Err
-                    end;
-                {error, _} = Err -> Err
+                    end
             end;
         ?HANDSHAKE_PACKET ->
             case Data#conn_data.handshake_keys of
                 undefined ->
-                    {error, no_handshake_keys};
+                    {ok, Data};
                 HSKeys ->
                     Keys = case Data#conn_data.role of
-                        client ->
-                            maps:get(server, HSKeys);
-                        server ->
-                            maps:get(client, HSKeys)
+                        client -> maps:get(server, HSKeys);
+                        server -> maps:get(client, HSKeys)
                     end,
-                    case quic_crypto:unprotect_packet(PacketData, 0, Keys, true) of
-                        {ok, _Header, Payload, _PN} ->
+                    PNSpaces = Data#conn_data.pn_spaces,
+                    HSPNSpace = maps:get(handshake, PNSpaces),
+                    LargestRecv = max(0, HSPNSpace#pn_space.largest_received),
+                    case quic_crypto:unprotect_packet(PacketData, LargestRecv, Keys, true) of
+                        {ok, _Header, Payload, PN} ->
+                            NewHSPN = HSPNSpace#pn_space{
+                                largest_received = max(PN, HSPNSpace#pn_space.largest_received),
+                                received_pns = lists:usort([PN | HSPNSpace#pn_space.received_pns])
+                            },
+                            NewPNSpaces = PNSpaces#{handshake => NewHSPN},
+                            Data1 = Data#conn_data{pn_spaces = NewPNSpaces},
                             case quic_frame:decode_all(Payload) of
                                 {ok, Frames} ->
-                                    process_frames(Frames, handshake, Data);
+                                    process_frames(Frames, handshake, Data1);
                                 {error, _} = Err -> Err
                             end;
                         {error, _} = Err ->
@@ -779,6 +871,16 @@ process_short_header_packet(PacketData, Data) ->
 
 try_key_update(PacketData, OldPeerKeys, DCIDLen, LargestRecv,
                AppPNSpace, PNSpaces, Data) ->
+    case Data#conn_data.sent_with_current_key of
+        false ->
+            {error, key_update_before_send};
+        true ->
+            do_key_update(PacketData, OldPeerKeys, DCIDLen, LargestRecv,
+                          AppPNSpace, PNSpaces, Data)
+    end.
+
+do_key_update(PacketData, OldPeerKeys, DCIDLen, LargestRecv,
+              AppPNSpace, PNSpaces, Data) ->
     PeerSecret = case Data#conn_data.role of
         client -> Data#conn_data.server_app_secret;
         server -> Data#conn_data.client_app_secret
@@ -787,20 +889,38 @@ try_key_update(PacketData, OldPeerKeys, DCIDLen, LargestRecv,
         client -> Data#conn_data.client_app_secret;
         server -> Data#conn_data.server_app_secret
     end,
+    HashAlgo = Data#conn_data.hash_algo,
+    KeyLen = Data#conn_data.key_len,
     case PeerSecret of
         undefined ->
-            {error, no_traffic_secret_for_key_update};
+            case Data#conn_data.prev_peer_keys of
+                {PrevKeys, Expiry} ->
+                    Now = erlang:monotonic_time(millisecond),
+                    case Now =< Expiry of
+                        true ->
+                            case quic_crypto:unprotect_packet(PacketData, LargestRecv,
+                                                              PrevKeys, false, DCIDLen) of
+                                {ok, _Header, Payload, PN} ->
+                                    process_decrypted_1rtt(Payload, PN, AppPNSpace, PNSpaces, Data);
+                                {error, _} ->
+                                    {error, decrypt_failed}
+                            end;
+                        false ->
+                            {error, no_traffic_secret_for_key_update}
+                    end;
+                undefined ->
+                    {error, no_traffic_secret_for_key_update}
+            end;
         _ ->
             {_OldKey, _OldIV, HPKey} = OldPeerKeys,
             {NewPeerSecret, {NewKey, NewIV}} =
-                quic_crypto:next_key_update(PeerSecret, sha256, 16),
+                quic_crypto:next_key_update(PeerSecret, HashAlgo, KeyLen),
             NewPeerKeys = {NewKey, NewIV, HPKey},
             case quic_crypto:unprotect_packet(PacketData, LargestRecv,
                                               NewPeerKeys, false, DCIDLen) of
                 {ok, _Header, Payload, PN} ->
-                    io:format("[conn:~p] key update at PN=~p~n", [self(), PN]),
                     {NewOwnSecret, {NewOwnKey, NewOwnIV}} =
-                        quic_crypto:next_key_update(OwnSecret, sha256, 16),
+                        quic_crypto:next_key_update(OwnSecret, HashAlgo, KeyLen),
                     OldAppKeys = Data#conn_data.app_keys,
                     {_, _, OwnHPKey} = case Data#conn_data.role of
                         client -> maps:get(client, OldAppKeys);
@@ -818,11 +938,16 @@ try_key_update(PacketData, OldPeerKeys, DCIDLen, LargestRecv,
                         client -> {NewOwnSecret, NewPeerSecret};
                         server -> {NewPeerSecret, NewOwnSecret}
                     end,
+                    PTO = quic_recovery:get_pto(Data#conn_data.recovery),
+                    PrevExpiry = erlang:monotonic_time(millisecond) + round(3 * PTO),
                     Data1 = Data#conn_data{
                         app_keys = NewAppKeys,
                         key_phase = 1 - Data#conn_data.key_phase,
                         client_app_secret = NewClientSecret,
-                        server_app_secret = NewServerSecret
+                        server_app_secret = NewServerSecret,
+                        prev_peer_keys = {OldPeerKeys, PrevExpiry},
+                        sent_with_current_key = false,
+                        acked_with_current_key = false
                     },
                     process_decrypted_1rtt(Payload, PN, AppPNSpace, PNSpaces, Data1);
                 {error, _} ->
@@ -831,24 +956,42 @@ try_key_update(PacketData, OldPeerKeys, DCIDLen, LargestRecv,
     end.
 
 process_decrypted_1rtt(Payload, PN, AppPNSpace, PNSpaces, Data) ->
-    RecvPNs = lists:usort([PN | AppPNSpace#pn_space.received_pns]),
-    NewAppPNSpace = AppPNSpace#pn_space{
-        largest_received = max(PN, AppPNSpace#pn_space.largest_received),
-        received_pns = RecvPNs
-    },
-    NewPNSpaces = PNSpaces#{application => NewAppPNSpace},
-    Data1 = Data#conn_data{pn_spaces = NewPNSpaces},
-    case quic_frame:decode_all(Payload) of
-        {ok, Frames} ->
-            case process_frames(Frames, application, Data1) of
-                {ok, Data2} ->
-                    Data3 = send_app_ack(PN, Data2),
-                    {ok, Data3};
-                {error, _} = Err2 ->
-                    Err2
-            end;
-        {error, _} = Err ->
-            Err
+    case lists:member(PN, AppPNSpace#pn_space.received_pns) of
+        true ->
+            {ok, Data};
+        false ->
+            RecvPNs = lists:usort([PN | AppPNSpace#pn_space.received_pns]),
+            NewAppPNSpace = AppPNSpace#pn_space{
+                largest_received = max(PN, AppPNSpace#pn_space.largest_received),
+                received_pns = RecvPNs
+            },
+            NewPNSpaces = PNSpaces#{application => NewAppPNSpace},
+            Data1 = Data#conn_data{pn_spaces = NewPNSpaces},
+            case quic_frame:decode_all(Payload) of
+                {ok, Frames} ->
+                    HasAckEliciting = lists:any(fun is_ack_eliciting/1, Frames),
+                    Data1a = case HasAckEliciting of
+                        true ->
+                            Now = erlang:monotonic_time(millisecond),
+                            Data1#conn_data{
+                                ack_eliciting_count = Data1#conn_data.ack_eliciting_count + 1,
+                                last_ack_eliciting_time = Now
+                            };
+                        false ->
+                            Data1
+                    end,
+                    case process_frames(Frames, application, Data1a) of
+                        {ok, Data2} ->
+                            Data3 = maybe_send_app_ack(PN, Data2),
+                            {ok, Data3};
+                        {transition_to_draining, _} = Trans ->
+                            Trans;
+                        {error, _} = Err2 ->
+                            Err2
+                    end;
+                {error, _} = Err ->
+                    Err
+            end
     end.
 
 process_frames([], _Level, Data) ->
@@ -857,6 +1000,8 @@ process_frames([Frame | Rest], Level, Data) ->
     case process_frame(Frame, Level, Data) of
         {ok, Data2} ->
             process_frames(Rest, Level, Data2);
+        {transition_to_draining, _} = Trans ->
+            Trans;
         {error, _} = Err ->
             Err
     end.
@@ -868,11 +1013,33 @@ process_frame(ping, _Level, Data) ->
     %% ACK-eliciting, but no action needed
     {ok, Data};
 
-process_frame({ack, LargestAcked, AckDelay, _Ranges}, Level, Data) ->
+process_frame({ack, LargestAcked, AckDelay, Ranges}, Level, Data) ->
     PNSpace = level_to_pn_space(Level),
-    {_LostPNs, NewRecovery} = quic_recovery:on_ack_received(
-        LargestAcked, AckDelay, PNSpace, Data#conn_data.recovery),
-    {ok, Data#conn_data{recovery = NewRecovery}};
+    PNSpaces = Data#conn_data.pn_spaces,
+    PN = maps:get(PNSpace, PNSpaces),
+    case LargestAcked >= PN#pn_space.next_pn of
+        true ->
+            {error, {protocol_violation, ack_for_unsent}};
+        false ->
+            AckedPNs = expand_ack_ranges(LargestAcked, Ranges),
+            ScaledDelay = case Data#conn_data.remote_params of
+                #transport_params{ack_delay_exponent = Exp} ->
+                    AckDelay * round(math:pow(2, Exp)) div 1000;
+                _ ->
+                    AckDelay * round(math:pow(2, ?DEFAULT_ACK_DELAY_EXPONENT)) div 1000
+            end,
+            {_LostPNs, AckedBytes, NewRecovery} = quic_recovery:on_ack_received(
+                LargestAcked, ScaledDelay, AckedPNs, PNSpace, Data#conn_data.recovery),
+            NewPN = PN#pn_space{largest_acked = max(LargestAcked, PN#pn_space.largest_acked)},
+            NewPNSpaces = PNSpaces#{PNSpace => NewPN},
+            AckedCurrent = PNSpace =:= application andalso AckedBytes > 0,
+            NewPNSpaces2 = prune_received_pns(PNSpace, NewPNSpaces, Data),
+            {ok, Data#conn_data{
+                recovery = NewRecovery,
+                pn_spaces = NewPNSpaces2,
+                acked_with_current_key = Data#conn_data.acked_with_current_key orelse AckedCurrent
+            }}
+    end;
 
 process_frame({crypto, Offset, CryptoData}, Level, Data) ->
     %% Buffer the crypto data and process via TLS
@@ -917,16 +1084,44 @@ process_frame({crypto, Offset, CryptoData}, Level, Data) ->
     end;
 
 process_frame({stream, StreamId, Offset, StreamData, Fin}, _Level, Data) ->
-    %% Get or create stream
-    {Stream, Data2} = get_or_create_stream(StreamId, Data),
-    case quic_stream:receive_data(Stream, StreamData, Offset, Fin) of
-        {ok, NewStream} ->
-            %% Notify waiters or deliver in active mode
-            NewStream2 = maybe_deliver_stream_data(StreamId, NewStream, Data2),
-            Streams = maps:put(StreamId, NewStream2, Data2#conn_data.streams),
-            {ok, Data2#conn_data{streams = Streams}};
-        {error, _} = Err ->
-            Err
+    DataLen = byte_size(StreamData),
+    NewDataRecvd = Data#conn_data.data_recvd + DataLen,
+    case NewDataRecvd > Data#conn_data.max_data_local of
+        true ->
+            {error, {flow_control_error, connection}};
+        false ->
+            {Stream, Data2} = get_or_create_stream(StreamId, Data),
+            FinalSizeCheck = case Stream#quic_stream.final_size of
+                undefined -> ok;
+                FS when Fin, Offset + DataLen =/= FS ->
+                    {error, {final_size_error, StreamId}};
+                FS when Offset + DataLen > FS ->
+                    {error, {final_size_error, StreamId}};
+                _ -> ok
+            end,
+            case FinalSizeCheck of
+                {error, _} = FSErr ->
+                    FSErr;
+                ok ->
+                    case quic_stream:receive_data(Stream, StreamData, Offset, Fin) of
+                        {ok, NewStream0} ->
+                            NewStream1 = case Fin of
+                                true -> NewStream0#quic_stream{final_size = Offset + DataLen};
+                                false -> NewStream0
+                            end,
+                            NewStream2 = maybe_deliver_stream_data(StreamId, NewStream1, Data2),
+                            Streams = maps:put(StreamId, NewStream2, Data2#conn_data.streams),
+                            Data3 = Data2#conn_data{
+                                streams = Streams,
+                                data_recvd = NewDataRecvd
+                            },
+                            Data4 = maybe_send_max_data(Data3),
+                            Data5 = maybe_send_max_stream_data(StreamId, NewStream2, Data4),
+                            {ok, Data5};
+                        {error, _} = Err ->
+                            Err
+                    end
+            end
     end;
 
 process_frame({max_data, MaxData}, _Level, Data) ->
@@ -943,24 +1138,24 @@ process_frame({max_stream_data, StreamId, MaxStreamData}, _Level, Data) ->
     end;
 
 process_frame({max_streams, bidi, MaxStreams}, _Level, Data) ->
-    {ok, Data};
+    {ok, Data#conn_data{max_streams_bidi_remote = MaxStreams}};
 
 process_frame({max_streams, uni, MaxStreams}, _Level, Data) ->
-    {ok, Data};
+    {ok, Data#conn_data{max_streams_uni_remote = MaxStreams}};
 
-process_frame({connection_close, ErrorCode, _FrameType, Reason}, _Level, Data) ->
-    Data#conn_data.owner ! {quic_error, self(), {connection_close, ErrorCode, Reason}},
-    Data#conn_data.owner ! {quic_closed, self()},
-    {ok, Data};
+process_frame({connection_close, _ErrorCode, _FrameType, _Reason}, _Level, Data) ->
+    reply_to_all_waiters(Data),
+    {transition_to_draining, Data};
 
-process_frame({connection_close_app, ErrorCode, Reason}, _Level, Data) ->
-    Data#conn_data.owner ! {quic_error, self(), {app_close, ErrorCode, Reason}},
-    Data#conn_data.owner ! {quic_closed, self()},
-    {ok, Data};
+process_frame({connection_close_app, _ErrorCode, _Reason}, _Level, Data) ->
+    reply_to_all_waiters(Data),
+    {transition_to_draining, Data};
 
 process_frame(handshake_done, _Level, Data) ->
-    %% Client receives HANDSHAKE_DONE from server
-    {ok, Data};
+    {ok, Data#conn_data{
+        handshake_confirmed = true,
+        handshake_keys = undefined
+    }};
 
 process_frame({datagram, DGData}, _Level, Data) ->
     case Data#conn_data.datagram_waiters of
@@ -968,18 +1163,52 @@ process_frame({datagram, DGData}, _Level, Data) ->
             gen_statem:reply(From, {ok, DGData}),
             {ok, Data#conn_data{datagram_waiters = Rest}};
         [] ->
-            case Data#conn_data.active of
-                false ->
-                    Queue = Data#conn_data.datagram_queue ++ [DGData],
-                    {ok, Data#conn_data{datagram_queue = Queue}};
-                _ ->
-                    Data#conn_data.owner ! {quic_datagram, self(), DGData},
-                    {ok, Data}
-            end
+            Queue = Data#conn_data.datagram_queue ++ [DGData],
+            {ok, Data#conn_data{datagram_queue = Queue}}
     end;
 
-process_frame({new_connection_id, _SeqNum, _RetirePriorTo, _CID, _Token}, _Level, Data) ->
-    {ok, Data};
+process_frame({stop_sending, StreamId, ErrorCode}, _Level, Data) ->
+    case maps:find(StreamId, Data#conn_data.streams) of
+        {ok, Stream} ->
+            NewStream = Stream#quic_stream{send_state = reset_sent},
+            Streams = maps:put(StreamId, NewStream, Data#conn_data.streams),
+            ResetFrame = quic_frame:encode({reset_stream, StreamId, ErrorCode,
+                                            Stream#quic_stream.send_offset}),
+            Data2 = send_app_data(ResetFrame, Data#conn_data{streams = Streams}),
+            {ok, Data2};
+        error ->
+            {ok, Data}
+    end;
+
+process_frame({reset_stream, StreamId, ErrorCode, FinalSize}, _Level, Data) ->
+    {Stream, Data2} = get_or_create_stream(StreamId, Data),
+    case Stream#quic_stream.final_size of
+        undefined ->
+            NewStream = Stream#quic_stream{
+                recv_state = reset_recvd,
+                final_size = FinalSize
+            },
+            lists:foreach(fun({From, _Length}) ->
+                gen_statem:reply(From, {error, {stream_reset, ErrorCode}})
+            end, NewStream#quic_stream.recv_waiters),
+            NewStream2 = NewStream#quic_stream{recv_waiters = []},
+            Streams = maps:put(StreamId, NewStream2, Data2#conn_data.streams),
+            {ok, Data2#conn_data{streams = Streams}};
+        FinalSize ->
+            NewStream = Stream#quic_stream{recv_state = reset_recvd},
+            Streams = maps:put(StreamId, NewStream, Data2#conn_data.streams),
+            {ok, Data2#conn_data{streams = Streams}};
+        _Other ->
+            {error, {final_size_error, StreamId}}
+    end;
+
+process_frame({new_connection_id, SeqNum, _RetirePriorTo, CID, Token}, _Level, Data) ->
+    Entry = #{seq => SeqNum, cid => CID, token => Token},
+    {ok, Data#conn_data{peer_cids = Data#conn_data.peer_cids ++ [Entry]}};
+
+process_frame({retire_connection_id, SeqNum}, _Level, Data) ->
+    NewCIDs = [C || C = #{seq := S} <- Data#conn_data.peer_cids, S =/= SeqNum],
+    {ok, Data#conn_data{peer_cids = NewCIDs}};
 
 process_frame(_Frame, _Level, Data) ->
     %% Unknown/unhandled frame - ignore
@@ -1001,28 +1230,44 @@ process_tls_action({handshake_keys, Keys}, Data) ->
     Data#conn_data{handshake_keys = Keys};
 
 process_tls_action({application_keys, Keys, ClientSecret, ServerSecret}, Data) ->
-    io:format("[conn:~p] app keys installed~n", [self()]),
+    {Key, _IV, _HP} = maps:get(client, Keys),
+    KLen = byte_size(Key),
+    HAlgo = case KLen of 16 -> sha256; 32 -> sha384; _ -> sha256 end,
     Data#conn_data{app_keys = Keys,
                    client_app_secret = ClientSecret,
-                   server_app_secret = ServerSecret};
+                   server_app_secret = ServerSecret,
+                   hash_algo = HAlgo,
+                   key_len = KLen};
 process_tls_action({application_keys, Keys}, Data) ->
-    io:format("[conn:~p] app keys installed (no secrets)~n", [self()]),
     Data#conn_data{app_keys = Keys};
 
 process_tls_action({handshake_complete, _ALPN, RemoteParams}, Data) ->
     Data#conn_data{
         handshake_done = true,
+        initial_keys = undefined,
         remote_params = RemoteParams,
         max_data_remote = case RemoteParams of
             #transport_params{initial_max_data = V} -> V;
+            _ -> 0
+        end,
+        max_streams_bidi_remote = case RemoteParams of
+            #transport_params{initial_max_streams_bidi = B} -> B;
+            _ -> 0
+        end,
+        max_streams_uni_remote = case RemoteParams of
+            #transport_params{initial_max_streams_uni = U} -> U;
             _ -> 0
         end
     };
 
 process_tls_action(send_handshake_done, Data) ->
-    %% Server sends HANDSHAKE_DONE frame in 1-RTT packet
     HDFrame = quic_frame:encode(handshake_done),
-    send_app_data(HDFrame, Data);
+    Data2 = send_app_data(HDFrame, Data),
+    Data2#conn_data{
+        handshake_confirmed = true,
+        handshake_keys = undefined,
+        address_validated = true
+    };
 
 process_tls_action(_, Data) ->
     Data.
@@ -1032,19 +1277,24 @@ process_tls_action(_, Data) ->
 %% ===================================================================
 
 send_crypto_data(CryptoData, initial, Data) ->
-    %% Send in an Initial packet with ACK for client's Initial
-    AckFrame = quic_frame:encode({ack, 0, 0, [0]}),
-    CryptoFrame = quic_frame:encode({crypto, 0, CryptoData}),
-    Payload = <<AckFrame/binary, CryptoFrame/binary>>,
-    #{server := ServerKeys} = Data#conn_data.initial_keys,
-    Keys = case Data#conn_data.role of
-        server -> ServerKeys;
-        client ->
-            #{client := CK} = Data#conn_data.initial_keys,
-            CK
-    end,
     PNSpaces = Data#conn_data.pn_spaces,
     InitPN = maps:get(initial, PNSpaces),
+    RecvPNs = InitPN#pn_space.received_pns,
+    AckFrame = case RecvPNs of
+        [] ->
+            quic_frame:encode({ack, 0, 0, [0]});
+        _ ->
+            Sorted = lists:reverse(lists:sort(RecvPNs)),
+            Ranges = build_ack_ranges(Sorted),
+            LargestAcked = hd(Sorted),
+            quic_frame:encode({ack, LargestAcked, 0, Ranges})
+    end,
+    CryptoFrame = quic_frame:encode({crypto, 0, CryptoData}),
+    Payload = <<AckFrame/binary, CryptoFrame/binary>>,
+    Keys = case Data#conn_data.role of
+        server -> maps:get(server, Data#conn_data.initial_keys);
+        client -> maps:get(client, Data#conn_data.initial_keys)
+    end,
     PN = InitPN#pn_space.next_pn,
 
     Packet = quic_packet:encode_initial(
@@ -1052,10 +1302,12 @@ send_crypto_data(CryptoData, initial, Data) ->
         <<>>, PN, Payload),
 
     ProtectedPacket = protect_initial_packet(Packet, PN, Keys),
-    send_udp(ProtectedPacket, Data),
-
     NewPNSpaces = PNSpaces#{initial => InitPN#pn_space{next_pn = PN + 1}},
-    Data#conn_data{pn_spaces = NewPNSpaces};
+    Data#conn_data{
+        pn_spaces = NewPNSpaces,
+        coalesce_buffer = <<(Data#conn_data.coalesce_buffer)/binary,
+                            ProtectedPacket/binary>>
+    };
 
 send_crypto_data(CryptoData, handshake, Data) ->
     CryptoFrame = quic_frame:encode({crypto, 0, CryptoData}),
@@ -1071,26 +1323,40 @@ send_crypto_data(CryptoData, handshake, Data) ->
     Packet = quic_packet:encode_handshake(
         Data#conn_data.dcid, Data#conn_data.scid, PN, CryptoFrame),
     ProtectedPacket = protect_long_packet(Packet, PN, Keys),
-    send_udp(ProtectedPacket, Data),
+    Coalesced = <<(Data#conn_data.coalesce_buffer)/binary,
+                  ProtectedPacket/binary>>,
+    send_udp(Coalesced, Data),
 
+    NewRecovery = quic_recovery:on_packet_sent(
+        PN, byte_size(ProtectedPacket), true, handshake, Data#conn_data.recovery),
     NewPNSpaces = PNSpaces#{handshake => HSPN#pn_space{next_pn = PN + 1}},
-    Data#conn_data{pn_spaces = NewPNSpaces};
+    Data#conn_data{pn_spaces = NewPNSpaces, recovery = NewRecovery,
+                   coalesce_buffer = <<>>};
 
 send_crypto_data(_CryptoData, _Level, Data) ->
-    Data.
+    flush_coalesce_buffer(Data).
 
 %% Send ACK for client's Handshake packet
 send_handshake_ack(Data) ->
     case Data#conn_data.handshake_keys of
         undefined -> Data;
         HSKeys ->
-            AckFrame = quic_frame:encode({ack, 0, 0, [0]}),
+            PNSpaces = Data#conn_data.pn_spaces,
+            HSPN = maps:get(handshake, PNSpaces),
+            RecvPNs = HSPN#pn_space.received_pns,
+            AckFrame = case RecvPNs of
+                [] ->
+                    quic_frame:encode({ack, 0, 0, [0]});
+                _ ->
+                    Sorted = lists:reverse(lists:sort(RecvPNs)),
+                    Ranges = build_ack_ranges(Sorted),
+                    LargestAcked = hd(Sorted),
+                    quic_frame:encode({ack, LargestAcked, 0, Ranges})
+            end,
             Keys = case Data#conn_data.role of
                 server -> maps:get(server, HSKeys);
                 client -> maps:get(client, HSKeys)
             end,
-            PNSpaces = Data#conn_data.pn_spaces,
-            HSPN = maps:get(handshake, PNSpaces),
             PN = HSPN#pn_space.next_pn,
             Packet = quic_packet:encode_handshake(
                 Data#conn_data.dcid, Data#conn_data.scid, PN, AckFrame),
@@ -1100,17 +1366,33 @@ send_handshake_ack(Data) ->
             Data#conn_data{pn_spaces = NewPNSpaces}
     end.
 
-send_app_ack(_RecvPN, Data) ->
+maybe_send_app_ack(_RecvPN, Data) ->
+    case Data#conn_data.ack_eliciting_count >= 2 of
+        true ->
+            send_app_ack_now(Data);
+        false ->
+            Data
+    end.
+
+send_app_ack_now(Data) ->
     PNSpaces = Data#conn_data.pn_spaces,
     AppPNSpace = maps:get(application, PNSpaces),
     RecvPNs = AppPNSpace#pn_space.received_pns,
     case RecvPNs of
         [] -> Data;
         _ ->
-            Ranges = build_ack_ranges(lists:reverse(RecvPNs)),
-            LargestAcked = hd(lists:reverse(RecvPNs)),
-            AckFrame = quic_frame:encode({ack, LargestAcked, 0, Ranges}),
-            send_app_data(AckFrame, Data)
+            Sorted = lists:reverse(lists:sort(RecvPNs)),
+            Ranges = build_ack_ranges(Sorted),
+            LargestAcked = hd(Sorted),
+            AckDelay = case Data#conn_data.last_ack_eliciting_time of
+                undefined -> 0;
+                T ->
+                    Now = erlang:monotonic_time(millisecond),
+                    max(0, (Now - T) * 1000)
+            end,
+            AckFrame = quic_frame:encode({ack, LargestAcked, AckDelay, Ranges}),
+            Data2 = send_app_data(AckFrame, Data),
+            Data2#conn_data{ack_eliciting_count = 0}
     end.
 
 build_ack_ranges(SortedDescPNs) ->
@@ -1149,7 +1431,6 @@ send_app_data(FrameData, Data) ->
             AppPN = maps:get(application, PNSpaces),
             PN = AppPN#pn_space.next_pn,
 
-            %% Pad payload to at least 4 bytes (RFC 9001 §5.4.2: sample requires it)
             PaddedFrameData = case byte_size(FrameData) < 4 of
                 true -> <<FrameData/binary, 0:(8 * (4 - byte_size(FrameData)))>>;
                 false -> FrameData
@@ -1159,12 +1440,30 @@ send_app_data(FrameData, Data) ->
                 Data#conn_data.key_phase),
             ProtectedPacket = protect_short_packet(Packet, PN, Keys,
                                                     byte_size(Data#conn_data.dcid)),
+            SentBytes = byte_size(ProtectedPacket),
             send_udp(ProtectedPacket, Data),
 
+            NewRecovery = quic_recovery:on_packet_sent(
+                PN, SentBytes, true, application, Data#conn_data.recovery),
             NewPNSpaces = PNSpaces#{application => AppPN#pn_space{next_pn = PN + 1}},
-            Data#conn_data{pn_spaces = NewPNSpaces}
+            Data#conn_data{
+                pn_spaces = NewPNSpaces,
+                recovery = NewRecovery,
+                bytes_sent = Data#conn_data.bytes_sent + SentBytes,
+                sent_with_current_key = true
+            }
     end.
 
+flush_coalesce_buffer(#conn_data{coalesce_buffer = <<>>} = Data) ->
+    Data;
+flush_coalesce_buffer(Data) ->
+    send_udp(Data#conn_data.coalesce_buffer, Data),
+    Data#conn_data{coalesce_buffer = <<>>}.
+
+send_udp(Packet, #conn_data{role = server, address_validated = false,
+                            bytes_sent = Sent, bytes_recv = Recv}) when
+        Sent + byte_size(Packet) > 3 * Recv ->
+    ok;
 send_udp(Packet, #conn_data{udp_socket = Socket, peer_addr = PeerAddr}) ->
     socket:sendto(Socket, Packet, PeerAddr).
 
@@ -1295,7 +1594,6 @@ get_or_create_stream(StreamId, Data) ->
         {ok, Stream} ->
             {Stream, Data};
         error ->
-            %% Auto-create peer-initiated stream
             MaxRecv = Data#conn_data.local_params#transport_params.initial_max_stream_data_bidi_remote,
             MaxSend = case Data#conn_data.remote_params of
                 #transport_params{initial_max_stream_data_bidi_local = V} -> V;
@@ -1304,21 +1602,16 @@ get_or_create_stream(StreamId, Data) ->
             Stream = quic_stream:new(StreamId, MaxSend, MaxRecv),
             Streams = maps:put(StreamId, Stream, Data#conn_data.streams),
 
-            %% Notify stream acceptors
             Data2 = case Data#conn_data.stream_acceptors of
                 [{From, _} | Rest] ->
                     StreamRef = {quic_stream, self(), StreamId},
                     gen_statem:reply(From, {ok, StreamRef}),
                     Data#conn_data{streams = Streams, stream_acceptors = Rest};
                 [] ->
-                    %% Notify owner in active mode
-                    case Data#conn_data.active of
-                        false -> ok;
-                        _ ->
-                            StreamRef = {quic_stream, self(), StreamId},
-                            Data#conn_data.owner ! {quic_stream_opened, self(), StreamRef}
-                    end,
-                    Data#conn_data{streams = Streams}
+                    Data#conn_data{
+                        streams = Streams,
+                        pending_streams = Data#conn_data.pending_streams ++ [StreamId]
+                    }
             end,
             {Stream, Data2}
     end.
@@ -1330,29 +1623,40 @@ allocate_stream_id(unidirectional, Data) ->
     Id = Data#conn_data.next_uni_stream,
     {Id, Data#conn_data{next_uni_stream = Id + 4}}.
 
-maybe_deliver_stream_data(StreamId, Stream, Data) ->
-    case Data#conn_data.active of
-        false ->
-            %% Passive mode - notify waiters
-            quic_stream:notify_recv_waiters(Stream);
-        _ ->
-            %% Active mode - deliver to owner
-            {ReadData, Stream2} = quic_stream:read(Stream),
+maybe_deliver_stream_data(_StreamId, Stream, _Data) ->
+    case Stream#quic_stream.recv_waiters of
+        [{From, Length} | RestW] ->
+            {ReadData, NewStream} = quic_stream:read(Stream, Length),
             case byte_size(ReadData) > 0 of
                 true ->
-                    StreamRef = {quic_stream, self(), StreamId},
-                    Data#conn_data.owner ! {quic, StreamRef, ReadData},
-                    case Stream2#quic_stream.fin_received andalso
-                         Stream2#quic_stream.recv_state =:= data_read of
-                        true ->
-                            Data#conn_data.owner ! {quic_stream_closed, StreamRef};
-                        false -> ok
-                    end,
-                    Stream2;
+                    gen_statem:reply(From, {ok, ReadData}),
+                    NewStream#quic_stream{recv_waiters = RestW};
                 false ->
-                    Stream
-            end
+                    case NewStream#quic_stream.fin_received of
+                        true ->
+                            gen_statem:reply(From, {error, closed}),
+                            NewStream#quic_stream{recv_waiters = RestW};
+                        false ->
+                            Stream
+                    end
+            end;
+        [] ->
+            Stream
     end.
+
+reply_to_all_waiters(Data) ->
+    maps:foreach(fun(_StreamId, Stream) ->
+        lists:foreach(fun({From, _Length}) ->
+            gen_statem:reply(From, {error, closed})
+        end, Stream#quic_stream.recv_waiters)
+    end, Data#conn_data.streams),
+    lists:foreach(fun({From, _}) ->
+        gen_statem:reply(From, {error, closed})
+    end, Data#conn_data.stream_acceptors),
+    lists:foreach(fun({From, _}) ->
+        gen_statem:reply(From, {error, closed})
+    end, Data#conn_data.datagram_waiters),
+    ok.
 
 %% Drain all available packets from the socket during handshake.
 %% Needed because multiple server response datagrams may arrive
@@ -1362,47 +1666,53 @@ handshake_drain(Socket, Data) ->
         {ok, {_Source, PacketData}} ->
             case process_received_packet(PacketData, Data) of
                 {ok, Data2} ->
-                    %% Send ACK if handshake just completed
                     Data3 = case Data2#conn_data.handshake_done of
                         true -> send_handshake_ack(Data2);
                         false -> Data2
                     end,
-                    %% Try to read more packets immediately
                     self() ! {handshake_drain, Socket},
                     maybe_transition_to_established(Data3);
-                {error, Reason} ->
+                {transition_to_draining, Data2} ->
+                    PTO = quic_recovery:get_pto(Data2#conn_data.recovery),
+                    {next_state, draining, Data2,
+                     [{state_timeout, round(3 * PTO), drain_complete}]};
+                {error, _Reason} ->
                     start_recv(Socket),
                     {keep_state, Data}
             end;
         {select, _} ->
-            %% No more data available, wait for next notification
             {keep_state, Data};
         {error, _} ->
             {keep_state, Data}
     end.
 
-idle_timeout_action(#conn_data{idle_timeout = Timeout}) ->
-    {{timeout, idle}, Timeout, idle_timeout}.
+idle_timeout_action(#conn_data{idle_timeout = Timeout, recovery = Recovery}) ->
+    PTO = quic_recovery:get_pto(Recovery),
+    EffectiveTimeout = max(Timeout, round(3 * PTO)),
+    {{timeout, idle}, EffectiveTimeout, idle_timeout}.
 
-start_keepalive_timer(IdleTimeout) ->
-    erlang:send_after(IdleTimeout div 2, self(), keepalive).
+keepalive_action(IdleTimeout) ->
+    {{timeout, keepalive}, IdleTimeout div 2, keepalive}.
+
+delayed_ack_actions(#conn_data{ack_eliciting_count = Count}) when Count >= 1, Count < 2 ->
+    [{{timeout, delayed_ack}, ?DEFAULT_MAX_ACK_DELAY, delayed_ack}];
+delayed_ack_actions(_) ->
+    [].
 
 maybe_transition_to_established(Data) ->
-    %% Check if handshake is fully complete (app keys + TLS handshake done)
     case {Data#conn_data.app_keys, Data#conn_data.handshake_done} of
         {undefined, _} ->
             {keep_state, Data};
         {_, false} ->
             {keep_state, Data};
         {_, true} ->
-            %% Notify waiting callers
             lists:foreach(fun({From, _}) ->
                 gen_statem:reply(From, {ok, self()})
             end, Data#conn_data.conn_waiters),
-            start_keepalive_timer(Data#conn_data.idle_timeout),
             {next_state, established,
              Data#conn_data{conn_waiters = []},
-             [idle_timeout_action(Data)]}
+             [idle_timeout_action(Data),
+              keepalive_action(Data#conn_data.idle_timeout)]}
     end.
 
 build_local_params(Opts, SCID) ->
@@ -1426,6 +1736,76 @@ build_local_params(Opts, SCID) ->
         initial_source_connection_id = SCID,
         grease_quic_bit = true
     }.
+
+prune_received_pns(PNSpace, PNSpaces, _Data) ->
+    SpaceData = maps:get(PNSpace, PNSpaces),
+    LargestAcked = SpaceData#pn_space.largest_acked,
+    case LargestAcked >= 0 of
+        true ->
+            Pruned = [P || P <- SpaceData#pn_space.received_pns, P >= LargestAcked],
+            PNSpaces#{PNSpace => SpaceData#pn_space{received_pns = Pruned}};
+        false ->
+            PNSpaces
+    end.
+
+is_ack_eliciting(padding) -> false;
+is_ack_eliciting({ack, _, _, _}) -> false;
+is_ack_eliciting({connection_close, _, _, _}) -> false;
+is_ack_eliciting({connection_close_app, _, _}) -> false;
+is_ack_eliciting(_) -> true.
+
+expand_ack_ranges(LargestAcked, Ranges) ->
+    expand_ack_ranges(LargestAcked, Ranges, []).
+
+expand_ack_ranges(LargestAcked, [FirstAckBlock], Acc) ->
+    PNs = lists:seq(max(0, LargestAcked - FirstAckBlock), LargestAcked),
+    lists:sort(Acc ++ PNs);
+expand_ack_ranges(LargestAcked, [FirstAckBlock | Rest], Acc) ->
+    BlockEnd = LargestAcked - FirstAckBlock,
+    PNs = lists:seq(max(0, BlockEnd), LargestAcked),
+    expand_gap_ranges(BlockEnd, Rest, Acc ++ PNs);
+expand_ack_ranges(_LargestAcked, [], Acc) ->
+    lists:sort(Acc).
+
+expand_gap_ranges(_Prev, [], Acc) ->
+    lists:sort(Acc);
+expand_gap_ranges(PrevLow, [{Gap, AckBlock} | Rest], Acc) ->
+    Start = PrevLow - Gap - 2,
+    End = Start - AckBlock,
+    PNs = lists:seq(max(0, End), max(0, Start)),
+    expand_gap_ranges(End, Rest, Acc ++ PNs).
+
+maybe_send_max_data(Data) ->
+    Consumed = Data#conn_data.data_recvd,
+    MaxLocal = Data#conn_data.max_data_local,
+    case Consumed > MaxLocal div 2 of
+        true ->
+            NewMax = MaxLocal + MaxLocal,
+            Frame = quic_frame:encode({max_data, NewMax}),
+            Data2 = send_app_data(Frame, Data),
+            Data2#conn_data{max_data_local = NewMax};
+        false ->
+            Data
+    end.
+
+maybe_send_max_stream_data(StreamId, Stream, Data) ->
+    Consumed = Stream#quic_stream.recv_data_size,
+    MaxRecv = Stream#quic_stream.max_recv_data,
+    case MaxRecv > 0 andalso Consumed > MaxRecv div 2 of
+        true ->
+            NewMax = MaxRecv + MaxRecv,
+            Frame = quic_frame:encode({max_stream_data, StreamId, NewMax}),
+            Data2 = send_app_data(Frame, Data),
+            case maps:find(StreamId, Data2#conn_data.streams) of
+                {ok, S} ->
+                    NewS = S#quic_stream{max_recv_data = NewMax},
+                    Data2#conn_data{streams = maps:put(StreamId, NewS, Data2#conn_data.streams)};
+                error ->
+                    Data2
+            end;
+        false ->
+            Data
+    end.
 
 handle_common_info({'DOWN', _MonRef, process, Owner, _Reason},
                    _State, #conn_data{owner = Owner} = Data) ->

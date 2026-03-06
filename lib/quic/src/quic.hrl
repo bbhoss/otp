@@ -196,8 +196,8 @@
 %% QUIC v2 initial salt (RFC 9369, Section 3.3.1)
 -define(QUIC_V2_INITIAL_SALT,
         <<16#0d, 16#de, 16#c3, 16#b1, 16#8c, 16#e1, 16#d0, 16#45,
-          16#97, 16#cd, 16#be, 16#d1, 16#c3, 16#9b, 16#94, 16#72,
-          16#b0, 16#7c, 16#7b, 16#a4>>).
+          16#40, 16#5c, 16#b1, 16#a6, 16#55, 16#07, 16#3a, 16#12,
+          16#8a, 16#0c, 16#42, 16#58>>).
 
 %% QUIC label prefixes for HKDF-Expand-Label
 %% HKDF-Expand-Label always uses "tls13 " prefix (per TLS 1.3 RFC 8446)
@@ -278,15 +278,21 @@
 }).
 
 -record(recovery, {
-    smoothed_rtt = 333     :: number(), %% milliseconds, initial 333ms
-    rttvar = 166           :: number(), %% milliseconds, initial 166ms
+    smoothed_rtt = 333     :: number(),
+    rttvar = 166           :: number(),
     min_rtt = infinity     :: number() | infinity,
     latest_rtt = 0         :: number(),
+    first_rtt_sample = false :: boolean(),
     max_ack_delay = 25     :: non_neg_integer(),
-    loss_time = #{         %% per PN space
+    loss_time = #{
         initial => undefined,
         handshake => undefined,
         application => undefined
+    } :: map(),
+    sent_packets = #{
+        initial => #{},
+        handshake => #{},
+        application => #{}
     } :: map(),
     congestion_window      :: non_neg_integer(),
     bytes_in_flight = 0    :: non_neg_integer(),

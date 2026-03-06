@@ -23,7 +23,7 @@
 -module(quic_crypto_SUITE).
 
 -include_lib("common_test/include/ct.hrl").
--include("../src/quic.hrl").
+-include("quic.hrl").
 
 -export([all/0, groups/0]).
 -export([

@@ -45,15 +45,11 @@
 %%   ok = gen_quic:send(Stream, <<"Hello">>),
 %%   {ok, Reply} = gen_quic:recv(Stream, 0).
 %%
-%% == Active Mode ==
+%% == Pull Model ==
 %%
-%% Messages delivered to the controlling process:
-%%   {quic, StreamRef, Data}                     - Stream data
-%%   {quic_stream_opened, Connection, StreamRef} - New stream from peer
-%%   {quic_stream_closed, StreamRef}             - Stream FIN received
-%%   {quic_closed, Connection}                   - Connection closed
-%%   {quic_error, Ref, Reason}                   - Error
-%%   {quic_datagram, Connection, Data}           - Unreliable datagram
+%% All data delivery is pull-based (like quic-go). Data buffers in
+%% the connection process until read via recv/accept_stream calls.
+%% No active mode — applications recv when ready.
 
 -module(gen_quic).
 
