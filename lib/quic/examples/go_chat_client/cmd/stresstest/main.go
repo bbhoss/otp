@@ -424,15 +424,58 @@ func bigbang(addr string, tlsConf *tls.Config, quicConf *quic.Config) {
 	log.Printf("[bigbang] done")
 }
 
+// fuzz: pick random scenarios with random parameters, run them concurrently.
+func fuzz(addr string, tlsConf *tls.Config, quicConf *quic.Config) {
+	// Pick 2-5 random scenarios to run concurrently
+	type scenario struct {
+		name string
+		fn   func()
+	}
+
+	all := []scenario{
+		{"stampede", func() { stampede(addr, 5+rand.IntN(30), 5+rand.IntN(60), tlsConf, quicConf) }},
+		{"churn", func() { churn(addr, 10+rand.IntN(100), tlsConf, quicConf) }},
+		{"multistream", func() { multistream(addr, 5+rand.IntN(30), tlsConf, quicConf) }},
+		{"flood", func() { flood(addr, 100+rand.IntN(2000), tlsConf, quicConf) }},
+		{"rude", func() { rude(addr, 10+rand.IntN(50), tlsConf, quicConf) }},
+		{"reconnect", func() { reconnect(addr, 5+rand.IntN(30), tlsConf, quicConf) }},
+	}
+
+	// Shuffle and pick a random subset
+	rand.Shuffle(len(all), func(i, j int) { all[i], all[j] = all[j], all[i] })
+	n := 2 + rand.IntN(len(all)-1) // 2 to len(all)
+	pick := all[:n]
+
+	names := make([]string, n)
+	for i, s := range pick {
+		names[i] = s.name
+	}
+	log.Printf("[fuzz] running %v concurrently", names)
+
+	var wg sync.WaitGroup
+	// Random stagger: launch each with 0-200ms jitter
+	for _, s := range pick {
+		wg.Add(1)
+		s := s
+		go func() {
+			defer wg.Done()
+			time.Sleep(time.Duration(rand.IntN(200)) * time.Millisecond)
+			s.fn()
+		}()
+	}
+	wg.Wait()
+}
+
 func main() {
 	addr := flag.String("addr", "localhost:4433", "server address")
-	scenario := flag.String("scenario", "all", "stampede|churn|multistream|flood|rude|reconnect|bigbang|all")
+	scenario := flag.String("scenario", "all", "stampede|churn|multistream|flood|rude|reconnect|bigbang|fuzz|all")
 	clients := flag.Int("clients", 20, "concurrent clients (stampede)")
 	msgs := flag.Int("msgs", 50, "messages per client (stampede)")
 	rounds := flag.Int("rounds", 100, "connect/disconnect cycles (churn, reconnect)")
 	streams := flag.Int("streams", 20, "streams per connection (multistream)")
 	floodN := flag.Int("flood-msgs", 1000, "messages to flood")
 	rudeN := flag.Int("rude-count", 50, "rude disconnects")
+	loops := flag.Int("loops", 1, "number of times to repeat (0=forever)")
 	flag.Parse()
 
 	log.SetFlags(log.Ltime | log.Lmicroseconds)
@@ -457,33 +500,48 @@ func main() {
 
 	start := time.Now()
 
-	switch *scenario {
-	case "stampede":
-		stampede(*addr, *clients, *msgs, tlsConf, quicConf)
-	case "churn":
-		churn(*addr, *rounds, tlsConf, quicConf)
-	case "multistream":
-		multistream(*addr, *streams, tlsConf, quicConf)
-	case "flood":
-		flood(*addr, *floodN, tlsConf, quicConf)
-	case "rude":
-		rude(*addr, *rudeN, tlsConf, quicConf)
-	case "reconnect":
-		reconnect(*addr, *rounds, tlsConf, quicConf)
-	case "bigbang":
-		bigbang(*addr, tlsConf, quicConf)
-	case "all":
-		log.Println("=== Running all scenarios sequentially ===")
-		stampede(*addr, *clients, *msgs, tlsConf, quicConf)
-		churn(*addr, *rounds, tlsConf, quicConf)
-		multistream(*addr, *streams, tlsConf, quicConf)
-		flood(*addr, *floodN, tlsConf, quicConf)
-		rude(*addr, *rudeN, tlsConf, quicConf)
-		reconnect(*addr, *rounds, tlsConf, quicConf)
-		log.Println("=== Now bigbang ===")
-		bigbang(*addr, tlsConf, quicConf)
-	default:
-		log.Fatalf("unknown scenario: %s", *scenario)
+	iteration := func(i int) {
+		if *loops != 1 {
+			log.Printf("=== Loop %d ===", i+1)
+		}
+		switch *scenario {
+		case "stampede":
+			stampede(*addr, *clients, *msgs, tlsConf, quicConf)
+		case "churn":
+			churn(*addr, *rounds, tlsConf, quicConf)
+		case "multistream":
+			multistream(*addr, *streams, tlsConf, quicConf)
+		case "flood":
+			flood(*addr, *floodN, tlsConf, quicConf)
+		case "rude":
+			rude(*addr, *rudeN, tlsConf, quicConf)
+		case "reconnect":
+			reconnect(*addr, *rounds, tlsConf, quicConf)
+		case "bigbang":
+			bigbang(*addr, tlsConf, quicConf)
+		case "fuzz":
+			fuzz(*addr, tlsConf, quicConf)
+		case "all":
+			stampede(*addr, *clients, *msgs, tlsConf, quicConf)
+			churn(*addr, *rounds, tlsConf, quicConf)
+			multistream(*addr, *streams, tlsConf, quicConf)
+			flood(*addr, *floodN, tlsConf, quicConf)
+			rude(*addr, *rudeN, tlsConf, quicConf)
+			reconnect(*addr, *rounds, tlsConf, quicConf)
+			bigbang(*addr, tlsConf, quicConf)
+		default:
+			log.Fatalf("unknown scenario: %s", *scenario)
+		}
+	}
+
+	if *loops == 0 {
+		for i := 0; ; i++ {
+			iteration(i)
+		}
+	} else {
+		for i := 0; i < *loops; i++ {
+			iteration(i)
+		}
 	}
 
 	log.Printf("Total time: %v", time.Since(start).Round(time.Millisecond))
