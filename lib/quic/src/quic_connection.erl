@@ -1407,8 +1407,38 @@ build_gap_ranges([{High, Low} | Rest], PrevLow) ->
     [{PrevLow - High - 2, High - Low} | build_gap_ranges(Rest, Low)].
 
 send_stream_frames(Frames, Data) ->
-    FramesBin = iolist_to_binary([quic_frame:encode(F) || F <- Frames]),
-    send_app_data(FramesBin, Data).
+    lists:foldl(fun(Frame, AccData) ->
+        send_stream_frame_fragmented(Frame, AccData)
+    end, Data, Frames).
+
+%% Fragment a single STREAM frame so each resulting QUIC packet
+%% fits within the max UDP payload size (RFC 9000 §14).
+send_stream_frame_fragmented({stream, StreamId, Offset, StreamData, Fin}, Data) ->
+    %% Max payload per QUIC packet ≈ 1200 - header(~30) - AEAD(16) = ~1154
+    %% STREAM frame header ≈ 1 + varint(StreamId) + varint(Offset) + varint(Len) ≈ 15
+    %% Conservative: 1100 bytes of stream data per packet
+    MaxChunk = 1100,
+    send_stream_chunks(StreamId, Offset, StreamData, Fin, MaxChunk, Data);
+send_stream_frame_fragmented(Frame, Data) ->
+    FrameBin = quic_frame:encode(Frame),
+    send_app_data(FrameBin, Data).
+
+send_stream_chunks(StreamId, Offset, <<>>, true, _MaxChunk, Data) ->
+    %% Empty FIN frame
+    FrameBin = quic_frame:encode({stream, StreamId, Offset, <<>>, true}),
+    send_app_data(FrameBin, Data);
+send_stream_chunks(StreamId, Offset, StreamData, Fin, MaxChunk, Data) ->
+    DataLen = byte_size(StreamData),
+    case DataLen =< MaxChunk of
+        true ->
+            FrameBin = quic_frame:encode({stream, StreamId, Offset, StreamData, Fin}),
+            send_app_data(FrameBin, Data);
+        false ->
+            <<Chunk:MaxChunk/binary, Rest/binary>> = StreamData,
+            FrameBin = quic_frame:encode({stream, StreamId, Offset, Chunk, false}),
+            Data2 = send_app_data(FrameBin, Data),
+            send_stream_chunks(StreamId, Offset + MaxChunk, Rest, Fin, MaxChunk, Data2)
+    end.
 
 send_app_data(FrameData, Data) ->
     case Data#conn_data.app_keys of

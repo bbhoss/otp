@@ -147,8 +147,11 @@ init_server(CertFile, KeyFile, ALPN, LocalParams) ->
 get_client_hello(#tls_state{role = client} = State) ->
     ClientHello = build_client_hello(State),
     CHBin = encode_handshake(?TLS_CLIENT_HELLO, ClientHello),
+    %% Extract client_random from ClientHello (offset 6: 1 type + 3 len + 2 legacy_version)
+    <<_:6/binary, ClientRandom:32/binary, _/binary>> = CHBin,
     NewState = State#tls_state{
         client_hello_bin = CHBin,
+        client_random = ClientRandom,
         transcript = CHBin,
         phase = wait_server_hello
     },
@@ -224,6 +227,10 @@ process_message(?TLS_SERVER_HELLO, Msg, initial,
                 transcript = NewTranscript,
                 phase = wait_encrypted_extensions
             },
+
+            %% Log handshake secrets for SSLKEYLOGFILE
+            quic_keylog:log_handshake_secrets(
+                State#tls_state.client_random, ClientHSSecret, ServerHSSecret),
 
             Actions = [
                 {handshake_keys, #{
@@ -307,6 +314,10 @@ process_message(?TLS_FINISHED, Msg, handshake,
             ClientFinHash = crypto:hash(HashAlgo, FullTranscript),
             ClientFinVerify = crypto:mac(hmac, HashAlgo, ClientFinKey, ClientFinHash),
             ClientFinMsg = encode_handshake(?TLS_FINISHED, ClientFinVerify),
+
+            %% Log application secrets for SSLKEYLOGFILE
+            quic_keylog:log_application_secrets(
+                State#tls_state.client_random, ClientAppSecret, ServerAppSecret),
 
             State2 = State#tls_state{
                 master_secret = MasterSecret,
@@ -432,6 +443,12 @@ process_message(?TLS_CLIENT_HELLO, Msg, initial,
                 transcript = Transcript4,
                 phase = wait_client_finished
             },
+
+            %% Log secrets for SSLKEYLOGFILE
+            quic_keylog:log_handshake_secrets(
+                ClientRandom, ClientHSSecret, ServerHSSecret),
+            quic_keylog:log_application_secrets(
+                ClientRandom, ClientAppSecret, ServerAppSecret),
 
             Actions = [
                 {send_crypto, initial, SHBin},

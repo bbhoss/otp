@@ -55,7 +55,8 @@ MODULES= \
 	quic_tls \
 	quic_transport_params \
 	quic_recovery \
-	quic_registry
+	quic_registry \
+	quic_keylog
 
 HRL_FILES = quic.hrl
 
