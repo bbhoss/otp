@@ -35,10 +35,6 @@
 
 -export([main/1]).
 
-%% Max data per send - must fit in a single QUIC packet (~1200 bytes MTU
-%% minus headers and encryption overhead)
--define(CHUNK_SIZE, 1024).
-
 main(_Args) ->
     TestCase = os:getenv("TESTCASE"),
     io:format("[interop-server] TESTCASE=~s~n", [TestCase]),
@@ -155,7 +151,7 @@ serve_file(Stream, Path) ->
     FilePathStr = binary_to_list(FilePath),
     case file:read_file(FilePathStr) of
         {ok, Data} ->
-            send_chunks(Stream, Data),
+            send_all(Stream, Data),
             gen_quic:close_stream(Stream);
         {error, Reason} ->
             io:format("[interop-server] File not found: ~s (~p)~n",
@@ -163,15 +159,24 @@ serve_file(Stream, Path) ->
             gen_quic:close_stream(Stream)
     end.
 
-send_chunks(_Stream, <<>>) ->
+%% Send data in chunks to respect stream-level flow control.
+%% The transport layer handles packet fragmentation, but we must
+%% chunk at the application level because gen_quic:send silently
+%% truncates to the available flow control window.
+send_all(_Stream, <<>>) ->
     ok;
-send_chunks(Stream, Data) when byte_size(Data) =< ?CHUNK_SIZE ->
-    gen_quic:send(Stream, Data);
-send_chunks(Stream, Data) ->
-    <<Chunk:?CHUNK_SIZE/binary, Rest/binary>> = Data,
+send_all(Stream, Data) ->
+    ChunkSize = min(byte_size(Data), 32768),
+    <<Chunk:ChunkSize/binary, Rest/binary>> = Data,
     case gen_quic:send(Stream, Chunk) of
-        ok -> send_chunks(Stream, Rest);
-        Err -> Err
+        ok ->
+            send_all(Stream, Rest);
+        {error, flow_control_blocked} ->
+            %% Wait for peer to open flow control window
+            timer:sleep(10),
+            send_all(Stream, Data);
+        {error, Reason} ->
+            {error, Reason}
     end.
 
 %% Test case support
